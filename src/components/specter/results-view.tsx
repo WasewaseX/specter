@@ -5,8 +5,8 @@ import { motion } from "framer-motion";
 import {
   AlertTriangle,
   ExternalLink,
-  Eye,
   Ghost,
+  Globe,
   Search,
   ShieldCheck,
 } from "lucide-react";
@@ -202,11 +202,11 @@ function ResultRow({
           <button
             type="button"
             onClick={() => onOpen(result.url)}
-            aria-label={`Open ${host} in encrypted viewer`}
+            aria-label={`Open ${host} in the Ghost Browser`}
             className="inline-flex items-center gap-1 text-xs text-zinc-400 transition-colors hover:text-emerald-300"
           >
-            <Eye className="h-3.5 w-3.5" aria-hidden="true" />
-            Ghost View
+            <Globe className="h-3.5 w-3.5" aria-hidden="true" />
+            Open Site
           </button>
 
           <a

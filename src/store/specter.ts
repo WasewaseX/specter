@@ -9,6 +9,12 @@ import { create } from "zustand";
 import { exportKey, generateSessionKey } from "@/lib/crypto";
 import { buildProxySrc, securePost, unsealProxyLocation } from "@/lib/secure-client";
 import {
+  ensureUvEngine,
+  uvEngineLoaded,
+  uvHref,
+  uvRealUrl,
+} from "@/lib/uv-browser";
+import {
   vaultCreate,
   vaultExists,
   vaultPersist,
@@ -29,9 +35,6 @@ export interface SearchResult {
 
 type SearchPhase = "idle" | "searching" | "done" | "error";
 
-const SID_KEY = "specter.sid";
-const KEY_KEY = "specter.key";
-
 interface SpecterState {
   // ── session ────────────────────────────────────────────────
   sid: string | null;
@@ -51,14 +54,19 @@ interface SpecterState {
   safeSearch: boolean;
   recencyDays: number | null;
 
-  // ── ghost viewer ───────────────────────────────────────────
+  // ── ghost browser ──────────────────────────────────────────
   viewerOpen: boolean;
   viewerSrc: string | null;
   viewerUrl: string | null; // real (decrypted) URL currently shown
   viewerStack: string[];
   viewerIndex: number;
   viewerLoading: boolean;
-  viewerAllowScripts: boolean; // opt-in compatibility mode (scripts run in an opaque sandbox)
+  /** true = hardened Ghost relay (scripts stripped); false = full Ghost Browser (Ultraviolet engine). */
+  viewerGhost: boolean;
+  /** true when the full browser engine (service worker + bare relay) booted successfully. */
+  uvAvailable: boolean;
+  /** bumped to force an iframe remount when a hard reload is required (ghost mode). */
+  viewerNonce: number;
 
   // ── privacy drawer ─────────────────────────────────────────
   drawerOpen: boolean;
@@ -81,7 +89,9 @@ interface SpecterState {
   viewerGo: (delta: number) => Promise<void>;
   viewerReload: () => Promise<void>;
   viewerLoaded: () => Promise<void>;
-  toggleViewerScripts: () => Promise<void>;
+  /** Poll hook: reconcile SPA (pushState) navigations inside the frame. */
+  viewerSync: () => void;
+  toggleViewerMode: () => Promise<void>;
   closeViewer: () => void;
   setDrawerOpen: (v: boolean) => void;
 
@@ -119,7 +129,9 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   viewerStack: [],
   viewerIndex: -1,
   viewerLoading: false,
-  viewerAllowScripts: false,
+  viewerGhost: false,
+  uvAvailable: false,
+  viewerNonce: 0,
 
   drawerOpen: false,
 
@@ -128,31 +140,10 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   vaultEntries: [],
   vaultKey: null,
 
-  // ── boot: restore or create an encrypted session ──────────
+  // ── boot: create a fresh encrypted session (RAM-only, never persisted) ──
   boot: async () => {
     set({ booting: true });
     try {
-      const existingSid = sessionStorage.getItem(SID_KEY);
-      const existingKey = sessionStorage.getItem(KEY_KEY);
-      if (existingSid && existingKey) {
-        const { importKey } = await import("@/lib/crypto");
-        const key = await importKey(existingKey);
-        const res = await fetch("/api/session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "verify", sid: existingSid }),
-        });
-        if (res.ok) {
-          const json = (await res.json()) as { alive?: boolean };
-          if (json.alive) {
-            set({ sid: existingSid, key, sessionReady: true, booting: false });
-            return;
-          }
-        }
-        sessionStorage.removeItem(SID_KEY);
-        sessionStorage.removeItem(KEY_KEY);
-      }
-
       const key = await generateSessionKey();
       const raw = await exportKey(key);
       const res = await fetch("/api/session", {
@@ -162,12 +153,15 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       });
       if (!res.ok) throw new Error("session_bootstrap_failed");
       const json = (await res.json()) as { sid: string };
-      sessionStorage.setItem(SID_KEY, json.sid);
-      sessionStorage.setItem(KEY_KEY, raw);
       set({ sid: json.sid, key, sessionReady: true, booting: false });
     } catch {
       set({ sessionReady: false, booting: false });
     }
+
+    // Boot the full browser engine (Ultraviolet + bare relay) in the background.
+    // If it is unavailable (no SW support, relay down) fall back to Ghost mode.
+    const uvReady = await ensureUvEngine();
+    set({ uvAvailable: uvReady, viewerGhost: uvReady ? get().viewerGhost : true });
   },
 
   setQuery: (q) => set({ query: q }),
@@ -241,11 +235,18 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   setSafeSearch: (v) => set({ safeSearch: v }),
   setRecencyDays: (v) => set({ recencyDays: v }),
 
-  // ── ghost viewer ────────────────────────────────────────────
+  // ── ghost browser ────────────────────────────────────────────
+
   openViewer: async (url) => {
-    const { key, sid, viewerAllowScripts } = get();
+    const { key, sid, viewerGhost } = get();
     if (!key || !sid) return;
-    const src = await buildProxySrc(key, sid, url, false, viewerAllowScripts);
+    let src: string | null;
+    if (viewerGhost || !uvEngineLoaded()) {
+      src = await buildProxySrc(key, sid, url, false, false);
+    } else {
+      src = uvHref(url);
+      if (!src) src = await buildProxySrc(key, sid, url, false, false);
+    }
     set({
       viewerOpen: true,
       viewerSrc: src,
@@ -258,7 +259,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
 
   /** Typed address in the viewer URL bar. */
   viewerNavigate: async (rawUrl) => {
-    const { key, sid, viewerAllowScripts } = get();
+    const { key, sid, viewerGhost } = get();
     if (!key || !sid) return;
     const trimmed = rawUrl.trim();
     if (!trimmed) return;
@@ -272,7 +273,13 @@ export const useSpecter = create<SpecterState>((set, get) => ({
     } catch {
       return;
     }
-    const src = await buildProxySrc(key, sid, url, false, viewerAllowScripts);
+    let src: string | null;
+    if (viewerGhost || !uvEngineLoaded()) {
+      src = await buildProxySrc(key, sid, url, false, false);
+    } else {
+      src = uvHref(url);
+      if (!src) src = await buildProxySrc(key, sid, url, false, false);
+    }
     set({ viewerSrc: src, viewerUrl: url, viewerLoading: true });
     // push into history stack
     const { viewerStack, viewerIndex } = get();
@@ -281,47 +288,109 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   },
 
   viewerGo: async (delta) => {
-    const { key, sid, viewerStack, viewerIndex, viewerAllowScripts } = get();
+    const { viewerGhost, viewerStack, viewerIndex } = get();
     const next = viewerIndex + delta;
-    if (!key || !sid || next < 0 || next >= viewerStack.length) return;
+    if (next < 0 || next >= viewerStack.length) return;
+
+    if (!viewerGhost) {
+      // Full browser mode: the proxied frame is same-origin, so native
+      // session history (with full page state) does the navigation.
+      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+      try {
+        frame?.contentWindow?.history.go(delta);
+        set({ viewerIndex: next, viewerLoading: true });
+        return;
+      } catch {
+        // fall through to stack-based navigation
+      }
+    }
+
+    const { key, sid } = get();
+    if (!key || !sid) return;
     const url = viewerStack[next];
-    const src = await buildProxySrc(key, sid, url, true, viewerAllowScripts);
+    const src = await buildProxySrc(key, sid, url, true, false);
     set({ viewerIndex: next, viewerSrc: src, viewerUrl: url, viewerLoading: true });
   },
 
   viewerReload: async () => {
-    const { key, sid, viewerUrl, viewerAllowScripts } = get();
+    const { key, sid, viewerUrl, viewerGhost } = get();
     if (!key || !sid || !viewerUrl) return;
-    const src = await buildProxySrc(key, sid, viewerUrl, true, viewerAllowScripts);
-    set({ viewerSrc: src, viewerLoading: true });
+
+    if (!viewerGhost) {
+      // same-origin frame → true in-place reload, session history preserved
+      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+      try {
+        frame?.contentWindow?.location.reload();
+        set({ viewerLoading: true });
+        return;
+      } catch {
+        // fall through to remount
+      }
+    }
+    const src = await buildProxySrc(key, sid, viewerUrl, true, false);
+    set({ viewerSrc: src, viewerLoading: true, viewerNonce: get().viewerNonce + 1 });
   },
 
-  toggleViewerScripts: async () => {
-    const next = !get().viewerAllowScripts;
-    set({ viewerAllowScripts: next });
+  /** Swap between the full Ghost Browser (Ultraviolet) and the hardened Ghost relay. */
+  toggleViewerMode: async () => {
+    const next = !get().viewerGhost;
+    set({ viewerGhost: next });
     await get().viewerReload();
   },
 
   /** Called on iframe load: reconciles the real location with our history stack. */
   viewerLoaded: async () => {
-    const { key, viewerStack, viewerIndex, viewerUrl } = get();
+    const { viewerGhost, viewerStack, viewerIndex, viewerUrl } = get();
     set({ viewerLoading: false });
-    if (!key) return;
     try {
       const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
       const href = frame?.contentWindow?.location.href;
       if (!href) return;
-      const realUrl = await unsealProxyLocation(key, href);
-      if (!realUrl || realUrl === viewerUrl) {
-        if (realUrl && realUrl === viewerUrl) return;
-        return;
+
+      let realUrl: string | null = null;
+      if (!viewerGhost) {
+        realUrl = uvRealUrl(href);
+      } else {
+        const { key } = get();
+        if (key) realUrl = await unsealProxyLocation(key, href);
       }
-      // user navigated inside the viewer via a rewritten link → push history
+      if (!realUrl || realUrl === viewerUrl) return;
+      // user navigated inside the viewer via the proxy → push history
       if (viewerStack[viewerIndex] === realUrl) return;
       const stack = [...viewerStack.slice(0, viewerIndex + 1), realUrl];
       set({ viewerStack: stack, viewerIndex: stack.length - 1, viewerUrl: realUrl });
     } catch {
       // cross-origin access — ignore
+    }
+  },
+
+  /**
+   * Poll hook (full browser mode): sites navigate with pushState inside the
+   * frame, which never fires an iframe load event — reconcile the address
+   * bar and history stack by reading the frame location.
+   */
+  viewerSync: () => {
+    const { viewerOpen, viewerGhost, viewerStack, viewerIndex, viewerUrl } = get();
+    if (!viewerOpen || viewerGhost) return;
+    try {
+      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+      const href = frame?.contentWindow?.location.href;
+      if (!href) return;
+      const real = uvRealUrl(href);
+      if (!real || real === viewerUrl) return;
+      // moving through existing stack entries (back/forward) vs a new page
+      if (viewerIndex > 0 && viewerStack[viewerIndex - 1] === real) {
+        set({ viewerIndex: viewerIndex - 1, viewerUrl: real });
+        return;
+      }
+      if (viewerIndex >= 0 && viewerIndex < viewerStack.length - 1 && viewerStack[viewerIndex + 1] === real) {
+        set({ viewerIndex: viewerIndex + 1, viewerUrl: real });
+        return;
+      }
+      const stack = [...viewerStack.slice(0, viewerIndex + 1), real];
+      set({ viewerStack: stack, viewerIndex: stack.length - 1, viewerUrl: real });
+    } catch {
+      // frame not ready / cross-origin — ignore
     }
   },
 
@@ -370,12 +439,6 @@ export const useSpecter = create<SpecterState>((set, get) => ({
     } catch {
       // ignore — best effort
     }
-    try {
-      sessionStorage.removeItem(SID_KEY);
-      sessionStorage.removeItem(KEY_KEY);
-    } catch {
-      // ignore
-    }
     vaultWipe();
     set({
       sid: null,
@@ -395,7 +458,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       viewerUrl: null,
       viewerStack: [],
       viewerIndex: -1,
-      viewerAllowScripts: false,
+      viewerGhost: get().uvAvailable ? false : true,
       drawerOpen: false,
       vaultExists: false,
       vaultUnlocked: false,

@@ -5,8 +5,8 @@ import { motion } from "framer-motion";
 import {
   ArrowLeft,
   ArrowRight,
-  Braces,
   ExternalLink,
+  Globe,
   Lock,
   RotateCw,
   ShieldCheck,
@@ -16,15 +16,16 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { useSpecter } from "@/store/specter";
 
 /**
- * ViewerOverlay — full-screen secure browsing surface.
+ * ViewerOverlay — full-screen secure browsing surface ("Ghost Browser").
  *
- * Hardened mode (default): pages are proxied with all scripts stripped and the
- * iframe sandbox keeps same-origin (needed to decrypt the location bar) while
- * blocking every script via sandbox + CSP.
+ * Full browser mode (default): the Ultraviolet engine (open-source, forked
+ * from GitHub) runs a same-origin service worker + bare relay, so sites load
+ * completely — images, video, styles and scripts — while every request is
+ * fetched by the relay, never directly from this device's network.
  *
- * Compatibility mode (opt-in, per site): the relay keeps site scripts but the
- * iframe sandbox drops same-origin entirely — scripts run inside an opaque
- * origin that cannot touch this app, its storage, or the opener.
+ * Ghost mode (opt-in hardened): pages are relayed through the encrypted
+ * /api/open proxy with all scripts stripped — a script-free reading mode for
+ * when you don't want a site executing anything at all.
  */
 export default function ViewerOverlay() {
   const viewerOpen = useSpecter((s) => s.viewerOpen);
@@ -33,12 +34,15 @@ export default function ViewerOverlay() {
   const viewerStack = useSpecter((s) => s.viewerStack);
   const viewerIndex = useSpecter((s) => s.viewerIndex);
   const viewerLoading = useSpecter((s) => s.viewerLoading);
-  const viewerAllowScripts = useSpecter((s) => s.viewerAllowScripts);
+  const viewerGhost = useSpecter((s) => s.viewerGhost);
+  const viewerNonce = useSpecter((s) => s.viewerNonce);
+  const uvAvailable = useSpecter((s) => s.uvAvailable);
   const viewerGo = useSpecter((s) => s.viewerGo);
   const viewerReload = useSpecter((s) => s.viewerReload);
   const viewerLoaded = useSpecter((s) => s.viewerLoaded);
+  const viewerSync = useSpecter((s) => s.viewerSync);
   const viewerNavigate = useSpecter((s) => s.viewerNavigate);
-  const toggleViewerScripts = useSpecter((s) => s.toggleViewerScripts);
+  const toggleViewerMode = useSpecter((s) => s.toggleViewerMode);
   const closeViewer = useSpecter((s) => s.closeViewer);
 
   const [address, setAddress] = useState(viewerUrl ?? "");
@@ -61,6 +65,14 @@ export default function ViewerOverlay() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [viewerOpen, closeViewer]);
 
+  // Full browser mode: sites navigate via pushState inside the frame (no load
+  // event) — poll the frame location to keep the address bar and history honest.
+  useEffect(() => {
+    if (!viewerOpen || viewerGhost) return;
+    const timer = setInterval(viewerSync, 700);
+    return () => clearInterval(timer);
+  }, [viewerOpen, viewerGhost, viewerSync]);
+
   if (!viewerOpen) return null;
 
   const canGoBack = viewerIndex > 0;
@@ -79,7 +91,7 @@ export default function ViewerOverlay() {
       className="fixed inset-0 z-50 flex flex-col bg-zinc-950"
       role="dialog"
       aria-modal="true"
-      aria-label="Secure encrypted viewer"
+      aria-label="Ghost Browser — secure encrypted browsing"
     >
       {/* toolbar */}
       <div className="flex h-12 shrink-0 items-center gap-1.5 border-b border-zinc-800 px-2 md:gap-2 md:px-3">
@@ -131,43 +143,44 @@ export default function ViewerOverlay() {
             className="w-full min-w-0 bg-transparent font-mono text-[11px] text-zinc-300 outline-none placeholder:text-zinc-600"
             placeholder="Type an address and press Enter — relayed through the encrypted tunnel"
           />
-          {viewerAllowScripts ? (
+          {viewerGhost ? (
             <span
-              className="hidden shrink-0 rounded border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 font-mono text-[9px] text-amber-300 md:inline"
-              title="Compatibility mode: site scripts run in an isolated sandbox"
+              className="hidden shrink-0 rounded border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 font-mono text-[9px] text-emerald-300 md:inline"
+              title="Ghost mode: scripts stripped, text-only reading via the hardened relay"
             >
-              COMPAT
+              GHOST
             </span>
           ) : (
             <span
               className="hidden shrink-0 rounded border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 font-mono text-[9px] text-emerald-300 md:inline"
-              title="Hardened mode: all scripts stripped from the relayed page"
+              title="Full browser: Ultraviolet engine relays everything — images, video and scripts render normally"
             >
-              HARDENED
+              FULL BROWSER
             </span>
           )}
         </form>
 
-        {/* compatibility mode toggle */}
+        {/* browser mode toggle */}
         <Button
           variant="ghost"
           size="icon"
-          onClick={() => void toggleViewerScripts()}
+          onClick={() => void toggleViewerMode()}
+          disabled={!uvAvailable && !viewerGhost}
           aria-label={
-            viewerAllowScripts
-              ? "Compatibility mode is on — switch to hardened mode (strip all scripts)"
-              : "Compatibility mode is off — allow site scripts in an isolated sandbox"
+            viewerGhost
+              ? "Ghost mode is on — switch to the full Ghost Browser (scripts and media enabled)"
+              : "Full browser is on — switch to Ghost mode (strip all scripts)"
           }
           title={
-            viewerAllowScripts
-              ? "Compatibility mode: scripts allowed (isolated sandbox). Click to return to hardened mode."
-              : "Hardened mode: all scripts stripped. Click to allow site scripts (isolated sandbox)."
+            viewerGhost
+              ? "Ghost mode: scripts stripped. Click to enable the full Ghost Browser."
+              : "Full browser: images, video and scripts render via the encrypted relay. Click for Ghost mode (text only)."
           }
         >
-          {viewerAllowScripts ? (
-            <Braces aria-hidden="true" className="text-amber-300" />
-          ) : (
+          {viewerGhost ? (
             <ShieldCheck aria-hidden="true" className="text-emerald-400" />
+          ) : (
+            <Globe aria-hidden="true" className="text-emerald-300" />
           )}
         </Button>
 
@@ -203,11 +216,15 @@ export default function ViewerOverlay() {
 
       <iframe
         id="specter-viewer-frame"
-        key={viewerSrc ?? "empty"}
+        key={`${viewerSrc ?? "empty"}#${viewerNonce}`}
         src={viewerSrc ?? undefined}
-        title="Secure encrypted viewer"
+        title="Ghost Browser — secure encrypted viewer"
         className="w-full flex-1 bg-white"
-        sandbox={viewerAllowScripts ? "allow-scripts" : "allow-same-origin"}
+        sandbox={
+          viewerGhost
+            ? "allow-same-origin"
+            : "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals allow-pointer-lock"
+        }
         onLoad={() => viewerLoaded()}
       />
     </motion.div>
