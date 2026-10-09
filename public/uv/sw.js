@@ -39,7 +39,15 @@ function getBareFallback() {
 }
 
 /* ── engine settings (RAM only) ─────────────────────────────── */
-const SETTINGS = { dataSaver: true, adBlock: true };
+/* dataSaver is OPT-IN: every site renders at full quality by default.
+ * Bandwidth efficiency is independent — media Range-streams through
+ * /api/stream (only watched seconds download) and trackers are blocked
+ * below, so a 100 MB video still costs ≈100 MB, never 160 MB. */
+const SETTINGS = { dataSaver: false, adBlock: true };
+/* ENGINE_REV: bump whenever behaviour changes. The app calls
+ * registration.update() on boot and the browser byte-compares sw.js, so this
+ * guarantees users never stay stranded on a stale (broken) worker. */
+const ENGINE_REV = "rev-9-buffered-post";
 
 /* ── tracker / ad firewall (substring match on hostname) ────── */
 const BLOCKED_HOSTS = [
@@ -185,7 +193,7 @@ uv.on("request", (req) => {
       return;
     }
 
-    // 2) data saver → server-side image recompression
+    // 2) data saver (OPT-IN) → server-side image recompression
     if (SETTINGS.dataSaver && isImageRequest(req)) {
       const real = url.href;
       const upstream = fetch(`/api/img?u=${encodeURIComponent(real)}`, {
@@ -271,6 +279,174 @@ function mediaPlayerPage(href) {
   });
 }
 
+/* ── direct bare-v3 transport (non-GET requests) ──────────────
+ * Ultraviolet routes subresource requests through bare-mux: a port
+ * handshake between this worker, the page client and a SharedWorker.
+ * That chain reliably delivers GETs but DROPS REQUEST BODIES, so every
+ * POST/PUT/PATCH API call arrives empty — YouTube's youtubei/v1/* is
+ * all POST, which is why YouTube died while plain-GET sites worked.
+ *
+ * For body-carrying methods we speak the TompHTTP bare v3 protocol
+ * DIRECTLY from this worker (single fetch, streamed body, no ports):
+ *   POST /bare/v3/  +  x-bare-url / x-bare-headers meta headers,
+ *   upstream method = this fetch's method, upstream headers from
+ *   x-bare-headers, response meta back on x-bare-status/-headers.
+ * GET documents/subresources keep using the full engine (uv.fetch)
+ * so URL rewriting of HTML/JS/CSS is untouched. */
+const BARE_RELAY = "/bare/v3/";
+const BARE_SEND_SKIP = new Set([
+  "host",
+  "connection",
+  "content-length",
+  "transfer-encoding",
+  "origin",
+  "referer",
+  "user-agent",
+  "x-bare-url",
+  "x-bare-headers",
+  "x-bare-version",
+  "x-bare-forward-headers",
+  "x-bare-pass-headers",
+  "x-bare-pass-status",
+  "x-bare-headers-0",
+  "x-bare-headers-1",
+  "x-bare-headers-2",
+  "x-bare-headers-3",
+  "x-bare-forward-headers-0",
+  "x-bare-pass-headers-0",
+  "x-bare-pass-status-0",
+]);
+
+function cacheKeyFor(real) {
+  // bare v3: presence of ?cache= enables conditional pass-through; any
+  // stable per-URL value works — no need for real md5.
+  let h = 0;
+  for (let i = 0; i < real.length; i++) {
+    h = (h * 31 + real.charCodeAt(i)) | 0;
+  }
+  return String(h >>> 0);
+}
+
+async function directBareFetch(event, real) {
+  const request = event.request;
+  const target = new URL(real);
+  const realOrigin = target.origin;
+
+  // ── upstream headers: the browser's own headers (perfectly legit
+  //    client fingerprint) minus hop-by-hop/origin-revealing ones.
+  const upstreamHeaders = {};
+  for (const [name, value] of request.headers.entries()) {
+    const lower = name.toLowerCase();
+    if (BARE_SEND_SKIP.has(lower)) continue;
+    if (lower.startsWith("x-bare-")) continue;
+    if (lower === "accept-encoding") continue; // relay negotiates its own
+    if (lower.startsWith("sec-fetch") || lower === "sec-ch-ua" || lower.startsWith("sec-ch-ua-")) {
+      // sec-fetch-* describe OUR origin relationship and would confuse the
+      // upstream (site: same-origin is a lie cross-origin); drop the family.
+      continue;
+    }
+    upstreamHeaders[name] = value;
+  }
+  upstreamHeaders["host"] = target.host;
+  upstreamHeaders["origin"] = realOrigin;
+  if (!upstreamHeaders["user-agent"]) upstreamHeaders["user-agent"] = navigator.userAgent;
+  // referer: the proxied page URL decoded to its real form
+  try {
+    if (request.referrer && request.referrer.startsWith(self.location.origin)) {
+      const ru = new URL(request.referrer);
+      const decoded = decodeURIComponent(ru.pathname.slice("/service/".length) + ru.search);
+      if (/^https?:/i.test(decoded)) upstreamHeaders["referer"] = decoded;
+    }
+  } catch (e) {
+    /* no referer — fine */
+  }
+  if (!upstreamHeaders["accept-language"]) upstreamHeaders["accept-language"] = "en-US,en;q=0.9";
+  if (!upstreamHeaders["accept"]) upstreamHeaders["accept"] = "*/*";
+
+  const url =
+    BARE_RELAY +
+    "?cache=" +
+    cacheKeyFor(real) +
+    "&XTransformPort=3030";
+
+  const init = {
+    method: request.method,
+    headers: {
+      "content-type": "application/json",
+      "x-bare-version": "3",
+      "x-bare-url": real,
+      "x-bare-headers": JSON.stringify(upstreamHeaders),
+    },
+    redirect: "follow",
+    cache: "no-store",
+    credentials: "omit",
+  };
+  if (!["GET", "HEAD"].includes(request.method)) {
+    /* Buffer the request body: API POSTs are small JSON payloads, and
+     * passing the incoming stream straight through throws "Failed to
+     * fetch" inside the service worker. Bodies are buffered in RAM only,
+     * never persisted — and responses still stream. */
+    try {
+      init.body = await request.arrayBuffer();
+      if (init.body && init.body.byteLength === 0) delete init.body;
+    } catch (e) {
+      /* no body */
+    }
+  }
+
+  const relayResp = await fetch(url, init);
+  if (!relayResp.ok && relayResp.status !== 304) {
+    // relay-level failure (BareError JSON) — surface a clean 502
+    let code = "relay_error";
+    try {
+      const j = await relayResp.json();
+      code = (j && j.error && j.error.code) || code;
+    } catch (e) {
+      /* body not JSON */
+    }
+    return new Response(JSON.stringify({ specter: "relay", code }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // ── unwrap bare meta ─────────────────────────────────────────
+  const metaRaw = relayResp.headers.get("x-bare-headers");
+  let meta = {};
+  try {
+    meta = metaRaw ? JSON.parse(metaRaw) : {};
+  } catch (e) {
+    meta = {};
+  }
+  const status = Number(relayResp.headers.get("x-bare-status")) || relayResp.status;
+
+  const outHeaders = new Headers();
+  for (const [name, value] of Object.entries(meta)) {
+    const lower = name.toLowerCase();
+    if (lower === "set-cookie" || lower === "connection" || lower === "transfer-encoding") continue;
+    /* NOTE: content-encoding/content-length are KEPT — the relay returns the
+       upstream's (possibly gzipped) body verbatim and the browser decompresses
+       it transparently, exactly like a native fetch. */
+    if (lower === "location" && typeof value === "string") {
+      // keep redirects inside the proxy
+      try {
+        const abs = new URL(value, target).toString();
+        outHeaders.set("location", `/service/${encodeURIComponent(abs)}`);
+      } catch (e) {
+        outHeaders.set("location", value);
+      }
+      continue;
+    }
+    if (Array.isArray(value)) value.forEach((v) => outHeaders.append(name, v));
+    else outHeaders.set(name, String(value));
+  }
+  // allow the page to read responses (same-origin anyway) + no opaque caching
+  outHeaders.set("access-control-allow-origin", "*");
+  if (!outHeaders.has("cache-control")) outHeaders.set("cache-control", "no-store");
+
+  return new Response(relayResp.body, { status, headers: outHeaders });
+}
+
 async function handleRequest(event) {
   if (uv.route(event)) {
     /*
@@ -310,6 +486,22 @@ async function handleRequest(event) {
               return resp;
             })
             .catch(() => new Response(null, { status: 502 }));
+        }
+        /* Body-carrying API calls (POST/PUT/PATCH/DELETE/OPTIONS) bypass the
+         * bare-mux port chain — it drops request bodies, which is what killed
+         * every POST-driven site (YouTube's youtubei/v1/* is all POST). The
+         * direct bare-v3 transport streams the body untouched; responses are
+         * plain data (JSON/binary) so no URL rewriting is lost by skipping the
+         * engine here. GET/HEAD keep the full engine (HTML/JS/CSS rewriting). */
+        const method = event.request.method.toUpperCase();
+        if (method !== "GET" && method !== "HEAD") {
+          return directBareFetch(event, real).catch(
+            (err) =>
+              new Response("relay failed: " + (err && (err.message || String(err))), {
+                status: 502,
+                headers: { "content-type": "text/plain" },
+              })
+          );
         }
       }
     } catch (e) {

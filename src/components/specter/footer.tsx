@@ -29,27 +29,28 @@ export default function Footer() {
         <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <span
             className="inline-flex items-center gap-1 text-emerald-300"
-            title="Ad/tracker requests blocked by the engine firewall this session"
+            title="Ad/tracker requests blocked by the engine firewall this session — blocked junk never touches your connection"
           >
             <ShieldCheck className="h-3 w-3" aria-hidden="true" />
             {stats.blocked} blocked
           </span>
-          <span
-            className="inline-flex items-center gap-1 text-emerald-300"
-            title="Bandwidth saved by Data Saver image recompression this session"
-          >
-            <Zap className="h-3 w-3" aria-hidden="true" />
-            {formatBytes(stats.bytesSaved)} saved
-            {stats.imagesCompressed > 0 ? ` · ${stats.imagesCompressed} imgs` : ""}
-            {stats.videosDeferred > 0 ? ` · ${stats.videosDeferred} vids deferred` : ""}
-          </span>
           {stats.mediaBytes > 0 ? (
             <span
               className="inline-flex items-center gap-1 text-emerald-300"
-              title="Video/audio bytes actually downloaded — Range streaming means this is only what you watched; replays and scrub-backs come from your device cache"
+              title="Video/audio bytes actually downloaded — Range streaming means this is only what you watched; replays and scrub-backs come from your device cache. A 100 MB video costs ≈100 MB, never more."
             >
               <PlayCircle className="h-3 w-3" aria-hidden="true" />
               {formatBytes(stats.mediaBytes)} video used
+            </span>
+          ) : null}
+          {stats.bytesSaved > 0 ? (
+            <span
+              className="inline-flex items-center gap-1 text-emerald-300"
+              title="Bandwidth saved by the optional Data Saver image recompression this session"
+            >
+              <Zap className="h-3 w-3" aria-hidden="true" />
+              {formatBytes(stats.bytesSaved)} saved
+              {stats.imagesCompressed > 0 ? ` · ${stats.imagesCompressed} imgs` : ""}
             </span>
           ) : null}
           <span className="hidden items-center gap-1 md:inline-flex">

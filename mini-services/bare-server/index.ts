@@ -179,10 +179,6 @@ function normalizeBareUrl(url: string | undefined): string | undefined {
 
 const httpServer = http.createServer((req, res) => {
   req.url = normalizeBareUrl(req.url);
-  // TEMP DEBUG: trace which x-bare-url values arrive (removed after diagnosis)
-  if (process.env.SPECTER_DEBUG === "1") {
-    console.log("[debug]", req.headers["x-bare-url"] ?? req.url);
-  }
   // NOTE: routeRequest() claims every path in v2.0.6 — guard with shouldRoute()
   // ourselves so the health endpoint still works.
   if (bareServer.shouldRoute(req)) {

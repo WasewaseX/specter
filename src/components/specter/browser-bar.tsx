@@ -146,7 +146,7 @@ function BrowserBarInner(props: {
         {props.dataSaver ? (
           <span
             className="hidden shrink-0 items-center gap-1 rounded border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 font-mono text-[9px] text-emerald-300 md:inline-flex"
-            title="Data Saver: videos stream by the second (100 MB video ≤ 100 MB, replays free), images recompressed server-side"
+            title="Data Saver (optional, currently on): plain videos wait for a tap and images are recompressed server-side. Either way, video streams by the second — a 100 MB video costs ≈100 MB."
           >
             <Zap aria-hidden="true" className="size-2.5" />
             DATA SAVER

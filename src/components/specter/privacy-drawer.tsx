@@ -259,17 +259,20 @@ export default function PrivacyDrawer() {
 
               <div className="flex items-center justify-between gap-4 border-b border-zinc-800/50 py-3">
                 <div className="min-w-0">
-                  <p className="text-xs text-zinc-200">Data Saver</p>
+                  <p className="text-xs text-zinc-200">
+                    Data Saver <span className="text-zinc-500">(optional — off)</span>
+                  </p>
                   <p className="text-[11px] text-zinc-500">
-                    Videos stream by the second, never transcoded — a 100 MB
-                    video costs ≈100 MB, never more · images recompressed
-                    server-side
+                    Off by default: full quality, nothing deferred. Video always
+                    streams by the second — a 100 MB video costs ≈100 MB either
+                    way. Turning this on additionally waits for a tap before
+                    loading plain videos and recompresses images server-side.
                   </p>
                 </div>
                 <Switch
                   checked={dataSaver}
                   onCheckedChange={setDataSaver}
-                  aria-label="Toggle data saver"
+                  aria-label="Toggle optional data saver"
                   className="data-[state=checked]:bg-emerald-400"
                 />
               </div>
@@ -301,10 +304,10 @@ export default function PrivacyDrawer() {
                   {stats.blocked}
                 </span>
               </DefRow>
-              <DefRow label="Images recompressed">
+              <DefRow label="Images recompressed (Data Saver)">
                 <span className="text-zinc-300">{stats.imagesCompressed}</span>
               </DefRow>
-              <DefRow label="Bandwidth saved">
+              <DefRow label="Bandwidth saved (Data Saver)">
                 <span className="inline-flex items-center gap-1.5 text-emerald-300">
                   <Zap className="size-3" aria-hidden="true" />
                   {stats.bytesSaved < 1024
@@ -314,7 +317,7 @@ export default function PrivacyDrawer() {
                       : `${(stats.bytesSaved / (1024 * 1024)).toFixed(1)} MB`}
                 </span>
               </DefRow>
-              <DefRow label="Videos deferred to tap">
+              <DefRow label="Videos deferred (Data Saver)">
                 <span className="text-zinc-300">{stats.videosDeferred}</span>
               </DefRow>
             </div>

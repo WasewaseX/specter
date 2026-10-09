@@ -99,6 +99,12 @@ export function ensureUvEngine(): Promise<boolean> {
       const registration = await navigator.serviceWorker.register(UV_SW, {
         scope: UV_SCOPE,
       });
+      /* Force-fresh worker: browsers byte-compare sw.js against the cached
+       * copy, but only re-check on their own schedule. Calling update() here
+       * means a user returning after an engine fix gets the new worker
+       * immediately instead of staying stranded on a broken stale one
+       * (sw.js carries an ENGINE_REV marker, so this always diffs). */
+      void registration.update().catch(() => undefined);
       await waitUntilActive(registration);
 
       await loadScript(BAREMUX_CLIENT);

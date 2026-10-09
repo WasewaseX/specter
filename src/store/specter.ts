@@ -232,7 +232,11 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   tabs: [INITIAL_TAB],
   activeTabId: INITIAL_TAB.id,
   uvAvailable: false,
-  dataSaver: true,
+  /* Data Saver is strictly optional — OFF by default so every site renders at
+   * full quality. Bandwidth efficiency never depended on it anyway: media is
+   * Range-streamed (only watched seconds download) and trackers are blocked
+   * at the engine level, so a 100 MB video costs ≈100 MB with zero recompression. */
+  dataSaver: false,
   adBlock: true,
   readerOn: false,
   stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },

@@ -10,7 +10,8 @@
  *  2. Popup → tab — target="_blank" links and window.open become new tabs
  *     in the Specter chrome instead of stray top-level windows.
  *  3. Privacy — navigator.sendBeacon is neutralised (pure tracking).
- *  4. Data Saver — plain <video>/<audio> elements never preload or autoplay:
+ *  4. Data Saver (OPT-IN, off by default) — when enabled in the privacy
+ *     drawer, plain <video>/<audio> elements never preload or autoplay:
  *     nothing is downloaded until you press play. Playback itself streams
  *     via HTTP Range (only watched seconds are downloaded) and responses
  *     are cacheable, so scrubbing back costs nothing extra. A "100 MB"
@@ -31,7 +32,11 @@
   window.__specterHook = true;
 
   /* ── settings (booleans only, RAM/localStorage — no history) ── */
-  var settings = { dataSaver: true, adBlock: true };
+  /* dataSaver is OPT-IN (off by default): full quality everywhere.
+   * Media routing (below) runs regardless — it only changes WHERE bytes
+   * flow through (Range streaming relay), never how much a video costs:
+   * a 100 MB file downloads only the seconds actually watched. */
+  var settings = { dataSaver: false, adBlock: true };
   try {
     var raw = window.localStorage.getItem("specter:settings");
     if (raw) {
@@ -236,11 +241,36 @@
   }
 
   /* ── 6. YouTube rescue: bot wall → embedded player ──────────── */
+  /* The hook runs UN-rewritten, so location.* is our own origin
+     (/service/<encoded>). Decode the proxied path to recover the REAL
+     URL before testing hostname/path — otherwise the rescue can never
+     recognise a YouTube watch page. */
+  function realLocation() {
+    try {
+      var prefix = "/service/";
+      try {
+        if (window.__uv$config && window.__uv$config.prefix) prefix = window.__uv$config.prefix;
+      } catch (e) {
+        /* default holds */
+      }
+      var raw = window.location.pathname + window.location.search;
+      if (raw.indexOf(prefix) === 0) {
+        var real = decodeURIComponent(raw.slice(prefix.length));
+        if (/^https?:/i.test(real)) return new URL(real);
+      }
+      return new URL(window.location.href);
+    } catch (e) {
+      return null;
+    }
+  }
+
   function youTubeVideoId() {
     try {
-      if (!/^www\.youtube(-nocookie)?\.com$/.test(location.hostname)) return null;
-      if (location.pathname !== "/watch") return null;
-      return new URLSearchParams(location.search).get("v");
+      var u = realLocation();
+      if (!u) return null;
+      if (!/^www\.youtube(-nocookie)?\.com$/.test(u.hostname)) return null;
+      if (u.pathname !== "/watch") return null;
+      return u.searchParams.get("v");
     } catch (e) {
       return null;
     }
@@ -334,9 +364,13 @@
     function sweep() {
       sweepTimer = null;
       if (settings.dataSaver) {
+        /* optional: only defer plain <video> preload/autoplay */
         tameVideos();
-        rewriteMediaSrcs();
       }
+      /* ALWAYS route plain media elements through the Range-streaming relay —
+         this is the no-data-amplification transport (100 MB video ≈ 100 MB,
+         scrub-back served from cache), it never changes quality. */
+      rewriteMediaSrcs();
       youTubeRescueCheck();
       sendPage();
     }
