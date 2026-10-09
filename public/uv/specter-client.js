@@ -10,9 +10,17 @@
  *  2. Popup → tab — target="_blank" links and window.open become new tabs
  *     in the Specter chrome instead of stray top-level windows.
  *  3. Privacy — navigator.sendBeacon is neutralised (pure tracking).
- *  4. Data Saver — videos never preload or autoplay: nothing is downloaded
- *     until you press play (playback itself streams via HTTP Range, so a
- *     "100 MB" video only costs the seconds you actually watch).
+ *  4. Data Saver — plain <video>/<audio> elements never preload or autoplay:
+ *     nothing is downloaded until you press play. Playback itself streams
+ *     via HTTP Range (only watched seconds are downloaded) and responses
+ *     are cacheable, so scrubbing back costs nothing extra. A "100 MB"
+ *     video therefore never costs more than ~100 MB — usually far less.
+ *
+ *     MSE-driven players (YouTube, Twitch, X) are detected and left strictly
+ *     alone: they manage their own buffers and pausing them breaks playback.
+ *  5. YouTube rescue — when YouTube's anti-datacenter bot wall blocks the
+ *     /watch page, the hook offers a one-click switch to the embedded
+ *     player (youtube-nocookie.com/embed), which plays without a login.
  *
  * Settings are read from localStorage("specter:settings") — the app chrome
  * (same origin) writes booleans there; the `storage` event updates live.
@@ -39,10 +47,7 @@
     if (event.key !== "specter:settings" || !event.newValue) return;
     try {
       var next = JSON.parse(event.newValue);
-      if (typeof next.dataSaver === "boolean") {
-        settings.dataSaver = next.dataSaver;
-        if (settings.dataSaver) tameVideos();
-      }
+      if (typeof next.dataSaver === "boolean") settings.dataSaver = next.dataSaver;
       if (typeof next.adBlock === "boolean") settings.adBlock = next.adBlock;
     } catch (e) {
       /* ignore */
@@ -145,7 +150,20 @@
     /* ignore */
   }
 
-  /* ── 4. data saver: defer every video until the user plays ─── */
+  /* ── 4. data saver: defer plain videos until the user plays ── */
+  function isJsDrivenPlayer(video) {
+    /* MediaSource-style players (YouTube, Twitch, X…) expose no src —
+       they feed buffers from JS. Touching those breaks playback, and they
+       already only fetch what they play, so Data Saver must skip them. */
+    try {
+      if (video.src || video.getAttribute("src")) return false;
+      if (video.querySelector && video.querySelector("source")) return false;
+      return true;
+    } catch (e) {
+      return true;
+    }
+  }
+
   function tameVideos() {
     if (!settings.dataSaver) return;
     try {
@@ -153,12 +171,22 @@
       for (var i = 0; i < videos.length; i++) {
         var video = videos[i];
         if (video.__specterTamed) continue;
-        video.__specterTamed = true;
+        if (isJsDrivenPlayer(video)) {
+          video.__specterTamed = true; /* mark seen — never touch */
+          continue;
+        }
+        /* only pre-play state is adjusted — never pause a playing video */
+        if (!video.paused) {
+          video.__specterTamed = true;
+          continue;
+        }
         try {
-          video.removeAttribute("autoplay");
-          video.autoplay = false;
+          if (video.autoplay) {
+            video.autoplay = false;
+            video.removeAttribute("autoplay");
+          }
           video.preload = "none";
-          if (!video.paused) video.pause();
+          video.__specterTamed = true;
           report({ type: "video-deferred" });
         } catch (e) {
           /* ignore */
@@ -207,24 +235,124 @@
     }
   }
 
+  /* ── 6. YouTube rescue: bot wall → embedded player ──────────── */
+  function youTubeVideoId() {
+    try {
+      if (!/^www\.youtube(-nocookie)?\.com$/.test(location.hostname)) return null;
+      if (location.pathname !== "/watch") return null;
+      return new URLSearchParams(location.search).get("v");
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function embedUrl(id) {
+    var target = "https://www.youtube-nocookie.com/embed/" + encodeURIComponent(id) + "?autoplay=1";
+    var prefix = "/service/";
+    try {
+      if (window.__uv$config && window.__uv$config.prefix) prefix = window.__uv$config.prefix;
+    } catch (e) {
+      /* default holds */
+    }
+    return prefix + encodeURIComponent(target);
+  }
+
+  function injectRescueBanner(id) {
+    try {
+      if (document.getElementById("specter-yt-rescue")) return;
+      var bar = document.createElement("div");
+      bar.id = "specter-yt-rescue";
+      bar.setAttribute("role", "status");
+      bar.style.cssText =
+        "position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483000;" +
+        "max-width:92vw;display:flex;align-items:center;gap:10px;padding:10px 14px;" +
+        "background:#0c1210;color:#d1fae5;border:1px solid #10b981;border-radius:10px;" +
+        "font:500 13px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;" +
+        "box-shadow:0 8px 28px rgba(0,0,0,.55);cursor:default";
+      var text = document.createElement("span");
+      text.textContent = "YouTube demands a sign-in on this network — switch to the embedded player?";
+      text.style.cssText = "color:#e5e7eb";
+      var btn = document.createElement("button");
+      btn.textContent = "▶ Play";
+      btn.style.cssText =
+        "border:0;border-radius:8px;padding:7px 14px;cursor:pointer;" +
+        "background:#10b981;color:#04110c;font-weight:700;font-size:13px";
+      btn.addEventListener("click", function () {
+        try {
+          window.location.replace(embedUrl(id));
+        } catch (e) {
+          /* ignore */
+        }
+      });
+      var close = document.createElement("button");
+      close.textContent = "✕";
+      close.setAttribute("aria-label", "Dismiss");
+      close.style.cssText =
+        "border:0;background:transparent;color:#6ee7b7;font-size:14px;cursor:pointer;padding:4px";
+      close.addEventListener("click", function () {
+        try {
+          bar.remove();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+      bar.appendChild(text);
+      bar.appendChild(btn);
+      bar.appendChild(close);
+      (document.body || document.documentElement).appendChild(bar);
+      report({ type: "yt-rescue-shown" });
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  var rescueDeadline = 0;
+  function youTubeRescueCheck() {
+    try {
+      var id = youTubeVideoId();
+      if (!id) return;
+      if (document.getElementById("specter-yt-rescue")) return;
+      var bodyText = document.body ? String(document.body.innerText).slice(0, 6000) : "";
+      var wall = /confirm you.{0,4}re not a bot|Sign in to confirm/i.test(bodyText);
+      var v = document.querySelector("video");
+      var playing = !!(v && !v.paused && v.readyState >= 2);
+      if (playing) return;
+      if (!wall) {
+        /* give a healthy watch page a grace period before offering the switch */
+        if (!rescueDeadline) rescueDeadline = Date.now() + 6500;
+        if (Date.now() < rescueDeadline) return;
+      }
+      injectRescueBanner(id);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  /* ── observer: debounced, never per-mutation work ───────────── */
   try {
+    var sweepTimer = null;
+    function sweep() {
+      sweepTimer = null;
+      if (settings.dataSaver) {
+        tameVideos();
+        rewriteMediaSrcs();
+      }
+      youTubeRescueCheck();
+      sendPage();
+    }
     var observer = new MutationObserver(function () {
-      tameVideos();
-      rewriteMediaSrcs();
+      if (sweepTimer !== null) return;
+      sweepTimer = setTimeout(sweep, 400);
     });
     var startObserver = function () {
       if (document.body) {
         observer.observe(document.body, { childList: true, subtree: true });
-        rewriteMediaSrcs();
-        tameVideos();
+        sweep();
       }
     };
     if (document.body) startObserver();
     else document.addEventListener("DOMContentLoaded", startObserver);
-    window.addEventListener("load", function () {
-      rewriteMediaSrcs();
-      tameVideos();
-    });
+    window.addEventListener("load", sweep);
   } catch (e) {
     /* ignore */
   }

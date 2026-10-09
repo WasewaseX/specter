@@ -60,6 +60,8 @@ export interface BrowserStats {
   imagesCompressed: number;
   bytesSaved: number;
   videosDeferred: number;
+  /** bytes actually streamed for video/audio (Range = only what was watched) */
+  mediaBytes: number;
 }
 
 type SearchPhase = "idle" | "searching" | "done" | "error";
@@ -233,7 +235,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   dataSaver: true,
   adBlock: true,
   readerOn: false,
-  stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0 },
+  stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },
 
   drawerOpen: false,
 
@@ -659,6 +661,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
         imagesCompressed: s.imagesCompressed + (delta.imagesCompressed ?? 0),
         bytesSaved: s.bytesSaved + (delta.bytesSaved ?? 0),
         videosDeferred: s.videosDeferred + (delta.videosDeferred ?? 0),
+        mediaBytes: s.mediaBytes + (delta.mediaBytes ?? 0),
       },
     });
   },
@@ -734,7 +737,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       tabs: [fresh],
       activeTabId: fresh.id,
       readerOn: false,
-      stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0 },
+      stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },
       drawerOpen: false,
       vaultExists: false,
       vaultUnlocked: false,

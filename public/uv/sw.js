@@ -241,6 +241,26 @@ self.addEventListener("message", (event) => {
 /* ── stock engine wiring ────────────────────────────────────── */
 const MEDIA_EXT = /\.(mp4|m4v|webm|ogv|mp3|m4a|ogg|wav|flac|mov)(\?|#|$)/i;
 
+/** Report media bytes actually pulled off the wire (Range streaming means
+ *  this is the seconds you watched, not the file size). */
+function reportMediaBytes(response, real) {
+  try {
+    let bytes = Number(response.headers.get("content-length"));
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      const cr = response.headers.get("content-range"); // bytes 0-999/12345
+      if (cr) {
+        const total = Number(cr.split("/")[1]);
+        if (Number.isFinite(total) && total > 0) bytes = total;
+      }
+    }
+    if (Number.isFinite(bytes) && bytes > 0) {
+      reportToClients({ type: "specter:media", bytes, url: real });
+    }
+  } catch (e) {
+    /* ignore */
+  }
+}
+
 function mediaPlayerPage(href) {
   const player = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Media</title><style>html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center}video{max-width:100%;max-height:100%}</style></head><body><video controls playsinline preload="metadata" src="/api/stream?u=${encodeURIComponent(
     href
@@ -266,6 +286,15 @@ async function handleRequest(event) {
       const dest = event.request.destination;
       const real = decodeURIComponent(reqUrl.pathname.slice("/service/".length) + reqUrl.search);
       if (/^https?:\/\//i.test(real)) {
+        /* Ultraviolet's HTML rewriter splices config.inject snippets BEFORE
+         * rewriting, so our page hook's "/uv/specter-client.js" src becomes a
+         * proxied URL and 404s. Serve our own asset back so the hook actually
+         * runs inside every proxied page. */
+        if (/\/uv\/specter-client\.js$/.test(real)) {
+          return fetch("/uv/specter-client.js", { cache: "no-cache" }).catch(
+            () => new Response(null, { status: 404 })
+          );
+        }
         const isMediaFile = MEDIA_EXT.test(real);
         const isMediaDest = dest === "video" || dest === "audio" || dest === "media";
         if (isMediaDest || (isMediaFile && (dest === "iframe" || dest === "document" || dest === "frame"))) {
@@ -275,7 +304,12 @@ async function handleRequest(event) {
           const range = event.request.headers.get("range");
           return fetch(`/api/stream?u=${encodeURIComponent(real)}`, {
             headers: range ? { range } : {},
-          }).catch(() => new Response(null, { status: 502 }));
+          })
+            .then((resp) => {
+              if (resp && resp.ok) reportMediaBytes(resp, real);
+              return resp;
+            })
+            .catch(() => new Response(null, { status: 502 }));
         }
       }
     } catch (e) {
@@ -287,7 +321,15 @@ async function handleRequest(event) {
 }
 
 self.addEventListener("fetch", (event) => {
-  event.respondWith(handleRequest(event));
+  event.respondWith(
+    handleRequest(event).catch((err) => {
+      // TEMP DEBUG: surface SW-level rejections as a readable response
+      return new Response("SW-ERROR: " + (err && (err.stack || err.message || String(err))), {
+        status: 599,
+        headers: { "content-type": "text/plain" },
+      });
+    })
+  );
 });
 
 self.addEventListener("install", () => {

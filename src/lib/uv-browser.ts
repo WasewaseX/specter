@@ -20,7 +20,8 @@ const BAREMUX_CLIENT = "/baremux/index.js";
 const BAREMUX_WORKER = "/baremux/worker.js";
 // NOTE: the ?v= cache-bust matters — the SharedWorker survives page reloads and
 // its dynamic import() caches by URL, so bump v whenever the transport file changes.
-const BARE_TRANSPORT = "/baremux/bare-transport.js?v=as3-2";
+// as3-3: transport now tags relay traffic with XTransformPort=3030 (gateway direct route).
+const BARE_TRANSPORT = "/baremux/bare-transport.js?v=as3-3";
 const BARE_RELAY = "/bare/";
 
 let enginePromise: Promise<boolean> | null = null;

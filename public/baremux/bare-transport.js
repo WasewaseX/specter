@@ -417,7 +417,7 @@ class ClientV3 extends Client {
         this.ready = true;
     }
     connect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror) {
-        const ws = new WebSocket(this.ws);
+        const ws = new WebSocket(this.ws + "?XTransformPort=3030");
         requestHeaders["Host"] = url.host;
         requestHeaders["Upgrade"] = "websocket";
         requestHeaders["Connection"] = "Upgrade";
@@ -435,8 +435,8 @@ class ClientV3 extends Client {
             if (message.type !== "open")
                 throw new TypeError("message was not of open type");
             // onMeta({
-            // 	protocol: message.protocol,
-            // 	setCookies: message.setCookies,
+            //  protocol: message.protocol,
+            //  setCookies: message.setCookies,
             // });
             onopen(message.protocol);
             ws.addEventListener("message", (ev) => {
@@ -482,7 +482,11 @@ class ClientV3 extends Client {
         else
             headers.Host = remote.host;
         options.headers = this.createBareHeaders(remote, headers);
-        const response = await fetch(this.http + "?cache=" + md5(remote.toString()), options);
+        // XTransformPort: lets the Caddy gateway route bare traffic straight to the
+        // relay mini-service (:3030) instead of through the Next.js rewrite — the
+        // rewrite path can drop POST bodies, which kills every POST-based site API
+        // (YouTube's youtubei/v1/* is all POST). Harmless when not behind the gateway.
+        const response = await fetch(this.http + "?cache=" + md5(remote.toString()) + "&XTransformPort=3030", options);
         const readResponse = await this.readBareResponse(response);
         return {
             body: response.body,

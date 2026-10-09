@@ -36,6 +36,11 @@ export default function Home() {
       } else if (data.type === "specter:img") {
         const saved = Number(data.saved) || 0;
         addStats({ imagesCompressed: 1, bytesSaved: saved });
+      } else if (data.type === "specter:media") {
+        // bytes the video element actually pulled over the wire (Range
+        // streaming = only what was watched; browser cache serves replays)
+        const bytes = Number(data.bytes) || 0;
+        if (bytes > 0) addStats({ mediaBytes: bytes });
       }
     });
     return unsubscribe;

@@ -1,6 +1,6 @@
 "use client";
 
-import { Lock, ShieldCheck, Zap } from "lucide-react";
+import { Lock, PlayCircle, ShieldCheck, Zap } from "lucide-react";
 
 import { useSpecter } from "@/store/specter";
 
@@ -43,6 +43,15 @@ export default function Footer() {
             {stats.imagesCompressed > 0 ? ` · ${stats.imagesCompressed} imgs` : ""}
             {stats.videosDeferred > 0 ? ` · ${stats.videosDeferred} vids deferred` : ""}
           </span>
+          {stats.mediaBytes > 0 ? (
+            <span
+              className="inline-flex items-center gap-1 text-emerald-300"
+              title="Video/audio bytes actually downloaded — Range streaming means this is only what you watched; replays and scrub-backs come from your device cache"
+            >
+              <PlayCircle className="h-3 w-3" aria-hidden="true" />
+              {formatBytes(stats.mediaBytes)} video used
+            </span>
+          ) : null}
           <span className="hidden items-center gap-1 md:inline-flex">
             {tabs.length} tab{tabs.length === 1 ? "" : "s"}
           </span>

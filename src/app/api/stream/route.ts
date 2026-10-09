@@ -10,7 +10,10 @@ export const dynamic = "force-dynamic";
  * The Ultraviolet service worker routes <video>/<audio> element requests here.
  * The upstream Range header passes straight through, so the browser downloads
  * ONLY the seconds it actually watches — a "100 MB" video costs kilobytes
- * until you scrub/play through it. Bodies stream (no buffering) in both
+ * until you scrub/play through it. Responses are cacheable, so re-watching or
+ * scrubbing back is served from the browser cache at zero extra cost — a
+ * 100 MB video can therefore never cost more than ~100 MB of data (never
+ * transcoded, never double-fetched). Bodies stream (no buffering) in both
  * directions. No logs, RAM only.
  */
 
@@ -84,13 +87,25 @@ export async function GET(req: NextRequest) {
     }
 
     const headers: Record<string, string> = {
-      "Cache-Control": "no-store",
       "Accept-Ranges": "bytes",
       "Referrer-Policy": "no-referrer",
     };
     for (const name of PASS_HEADERS) {
       const value = upstream.headers.get(name);
       if (value) headers[name] = value;
+    }
+
+    /* Caching: media is content-addressed (signed URLs never change content),
+     * so letting the browser cache range responses makes scrub-back and
+     * replays free — watching a 100 MB video can never cost more than
+     * ~100 MB. Only honour an upstream no-store when it is explicit. */
+    const upstreamCache = upstream.headers.get("cache-control") ?? "";
+    if (/no-store|no-cache/i.test(upstreamCache) && !/max-age/i.test(upstreamCache)) {
+      headers["Cache-Control"] = "no-store";
+    } else if (/max-age/i.test(upstreamCache)) {
+      headers["Cache-Control"] = upstreamCache;
+    } else {
+      headers["Cache-Control"] = "private, max-age=1800";
     }
 
     return new NextResponse(upstream.body, {

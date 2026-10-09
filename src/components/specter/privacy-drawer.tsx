@@ -261,7 +261,9 @@ export default function PrivacyDrawer() {
                 <div className="min-w-0">
                   <p className="text-xs text-zinc-200">Data Saver</p>
                   <p className="text-[11px] text-zinc-500">
-                    Images recompressed server-side · videos wait for your tap
+                    Videos stream by the second, never transcoded — a 100 MB
+                    video costs ≈100 MB, never more · images recompressed
+                    server-side
                   </p>
                 </div>
                 <Switch

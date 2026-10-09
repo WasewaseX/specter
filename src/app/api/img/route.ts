@@ -108,6 +108,21 @@ export async function GET(req: NextRequest) {
       });
     }
 
+    // tiny images: recompressing costs latency and rarely shrinks them —
+    // pass through untouched (keeps thumbnail-heavy sites like YouTube snappy)
+    if (buf.byteLength <= 30_000) {
+      return new NextResponse(new Uint8Array(buf), {
+        status: 200,
+        headers: {
+          "Content-Type": contentType || "image/jpeg",
+          "X-Orig-Bytes": String(buf.byteLength),
+          "X-Web-Bytes": String(buf.byteLength),
+          "Cache-Control": "private, max-age=3600",
+          "Referrer-Policy": "no-referrer",
+        },
+      });
+    }
+
     // already-efficient formats pass through untouched
     if (PASS_THROUGH.has(contentType)) {
       return new NextResponse(new Uint8Array(buf), {
