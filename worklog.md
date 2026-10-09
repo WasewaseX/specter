@@ -154,3 +154,24 @@ Stage Summary:
 - Firewall is precise (parsed hostnames), auditable (rule labels in UI), and bypassable per site for the session.
 - The network pipeline is regression-tested in-product (10/10): POST bodies, redirects, cookies, images, Range 206, download headers, HTML rewrite, blocker precision — rerun anytime from PRIVACY CONTROL → ENGINE DIAGNOSTICS.
 - Baselines intact: YouTube search works, BBC images full quality, HN/Wikipedia unchanged, no bandwidth amplification, iwara no longer on the start page.
+
+---
+Task ID: 10
+Agent: Z.ai Code (main)
+Task: Diagnose and fix the user-reported `{"specter":"relay","code":"relay_error"}` error; keep engine failure honest + self-healing; push to GitHub
+
+Work Log:
+- ROOT CAUSE 1 (the literal bug): the SW read relay error bodies as `j.error.code`, but @tomphttp/bare-server-node returns FLAT `{code,id,message}` — so every real relay/upstream error collapsed into the generic `relay_error` string the user saw.
+- ROOT CAUSE 2 (raw JSON leak): on relay-level failure `directBareFetch` RETURNED a 502 JSON response; `directDocument` only throws-protects, it passes non-HTML responses through → a document navigation during an outage rendered the raw JSON body in the tab.
+- ROOT CAUSE 3 (no mid-outage healing): the supervisor guard ran every 15s, and the SW had no probe/retry — a relay restart window (crash, dev-server restart) surfaced errors to the user with no recovery.
+- ROOT CAUSE 4 (stale process): the relay on :3030 was an OLD bun process (pid 941) predating the supervisor; the supervisor never owned/restarted the current build.
+- FIX sw.js (ENGINE_REV rev-13-relay-heal): RelayError class (kind: unreachable|protocol|upstream); failures are classified from the flat JSON (header-family codes = protocol bug; any other structured BareError = upstream refused — the relay itself is alive); non-JSON bodies/fetch throws = relay_unreachable; directBareFetch now THROWS instead of leaking JSON; self-healing transport — shared probe loop (5 × 1.2s against GET /bare/) + one healed retry, queued when state is already unhealthy so a crash window doesn't burn the retry; readable errorPage now renders the real code with per-class honest notes ("Secure relay is restarting" / "Site unreachable through the relay").
+- FIX relay-supervisor.ts: guard interval 15s → 5s; spawn waits for the port and announces "relay healthy"; restart retry tightened to 1s.
+- OPS: killed the stale bun relay; supervisor spawned a fresh `node index.ts` child (verified via ss + health endpoint).
+- SELF-TEST: new 11th case `relay_error_classification` — refuses 127.0.0.1:1 through the real pipeline and asserts a classified RelayError (kind=upstream, real code, never the generic relay_error).
+- VERIFIED E2E (agent-browser): diagnostics 11/11 on rev-13-relay-heal; sustained outage loop (relay killed every 1s × 14s) → mid-outage navigation rendered "◈ SECURE RELAY IS RESTARTING — relay_unreachable" (NOT raw JSON); supervisor respawned (new pid); error page auto-retry landed the full Iran–Wikipedia article with zero manual action and no app restart; quick outages (<5s) self-heal invisibly; YouTube home + in-frame search "lofi hip hop" (POST pipeline) unchanged; BBC 21/33 images instant + lazy; HN rendered; zero console errors after recovery; lint + tsc clean.
+
+Stage Summary:
+- The user-visible `{"specter":"relay","code":"relay_error"}` is fixed at every layer: real error codes surface, documents never render raw protocol JSON, and the transport heals through relay restarts (invisible for short windows, honest + auto-retrying for long ones).
+- Relay lifecycle is now fully supervisor-owned (node child, 5s guard, health announcements); the stale bun process is gone.
+- Baselines intact: YouTube search, BBC images, HN/Wikipedia, Range video pipeline, 11/11 in-product diagnostics.

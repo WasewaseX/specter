@@ -38,7 +38,7 @@ const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-12b-precise-block";
+const ENGINE_REV = "rev-13-relay-heal";
 
 /* ── tracker / ad firewall (parsed-hostname matching) ──────────
  * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
@@ -256,6 +256,65 @@ function storeCookies(jar, meta) {
  * security headers that would jail the proxied page are stripped; redirects
  * and cookies stay inside the tunnel. */
 const BARE_RELAY = "/bare/v3/";
+/* bare-server answers GET /bare/ with its version meta (200) even without
+ * protocol headers — the cheapest reliable liveness probe. */
+const BARE_HEALTH = "/bare/";
+
+/* ── relay health + self-healing ──────────────────────────────
+ * The bare relay is supervised (auto-restarted when it dies), but between a
+ * crash and the respawn there is a short window when every relayed request
+ * fails. Instead of surfacing raw errors during that window, the transport:
+ *   1. CLASSIFIES the failure — relay_unreachable (relay process down / the
+ *      gateway answered with its own non-protocol error), a bare protocol
+ *      error code (MISSING_BARE_HEADER…), or an upstream error the site
+ *      itself returned;
+ *   2. HEALS — probes the relay with a short backoff (the supervisor brings
+ *      it back in a few seconds) and retries the request ONCE;
+ *   3. never renders a raw protocol JSON into a tab — documents get the
+ *      readable retry page instead. */
+const RELAY_STATE = { healthy: true, probePromise: null };
+
+class RelayError extends Error {
+  constructor(kind, code, message) {
+    super(message || code || kind);
+    this.name = "RelayError";
+    this.kind = kind; // "unreachable" | "protocol" | "upstream"
+    this.code = code || kind;
+  }
+}
+
+/** True when the relay process answers through the app gateway. */
+async function relayHealthProbe() {
+  try {
+    const r = await fetch(BARE_HEALTH + "?XTransformPort=3030&heal=" + Date.now(), {
+      cache: "no-store",
+      credentials: "omit",
+    });
+    return r.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Probe until the relay is back (max ≈ 6s). Shared so concurrent failures
+ * wait on ONE probe loop instead of stampeding the gateway. */
+function healRelay() {
+  if (RELAY_STATE.probePromise) return RELAY_STATE.probePromise;
+  RELAY_STATE.probePromise = (async () => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 1200));
+      if (await relayHealthProbe()) {
+        RELAY_STATE.healthy = true;
+        return true;
+      }
+    }
+    return false;
+  })().finally(() => {
+    RELAY_STATE.probePromise = null;
+  });
+  return RELAY_STATE.probePromise;
+}
+
 const SECURITY_STRIP = [
   "cross-origin-embedder-policy",
   "cross-origin-opener-policy",
@@ -400,29 +459,93 @@ async function directBareFetch(event, real, jar) {
     }
   }
 
-  const relayResp = await fetch(url, init);
+  // The engine MUST work while the relay restarts underneath it: probe with
+  // a short backoff first when we already know the relay went away, so the
+  // first request after a crash doesn't burn its only retry.
+  if (!RELAY_STATE.healthy) await healRelay();
+
+  let relayResp;
+  try {
+    relayResp = await fetch(url, init);
+  } catch (e) {
+    RELAY_STATE.healthy = false;
+    if (await healRelay()) {
+      try {
+        relayResp = await fetch(url, init);
+      } catch (e2) {
+        throw new RelayError("unreachable", "relay_unreachable", "secure relay did not come back");
+      }
+    } else {
+      throw new RelayError("unreachable", "relay_unreachable", "secure relay is restarting");
+    }
+  }
 
   // A real proxied response carries x-bare-* meta; anything else is a
-  // relay-level failure (BareError JSON) — surface a clean 502.
+  // relay-level failure. bare-server-node answers errors with a FLAT JSON
+  // body {code, id, message} (older builds wrap it as {error:{code}}); the
+  // gateway can also answer with non-JSON 5xx text when the relay process
+  // is down. Classify honestly instead of leaking a generic code.
   const metaRaw = assembleBareMeta(relayResp.headers);
   const hasMeta = metaRaw !== null || relayResp.headers.get("x-bare-status") !== null;
   if (!hasMeta && !relayResp.ok && relayResp.status !== 304) {
-    let code = "relay_error";
+    let code = "relay_unreachable";
+    let kind = "unreachable";
+    let message = "relay is not answering (HTTP " + relayResp.status + ")";
     try {
-      const j = await relayResp.json();
-      code = (j && j.error && j.error.code) || code;
+      const text = await relayResp.text();
+      try {
+        const j = JSON.parse(text);
+        const realCode = (j && (j.code || (j.error && j.error.code))) || null;
+        if (realCode) {
+          code = realCode;
+          // A structured BareError JSON means the relay process itself is
+          // ALIVE — it answered our request. bare-server-node maps protocol
+          // mistakes to 400 + *_BARE_HEADER codes, and EVERYTHING else
+          // (upstream refused, DNS, socket…) to generic 500 UNKNOWN-family
+          // codes. So: header-family codes = our protocol bug, any other
+          // structured error = the upstream fetch failed.
+          if (/^(MISSING|INVALID|FORBIDDEN)_BARE_HEADER|^CONNECTION_LIMIT/.test(realCode)) {
+            kind = "protocol";
+          } else {
+            kind = "upstream";
+          }
+          message = String((j && (j.message || (j.error && j.error.message))) || realCode).slice(0, 300);
+        }
+      } catch (e) {
+        /* non-JSON (gateway error page) → unreachable */
+      }
     } catch (e) {
-      /* body not JSON */
+      /* body unreadable → unreachable */
     }
-    return new Response(JSON.stringify({ specter: "relay", code }), {
-      status: 502,
-      headers: { "content-type": "application/json" },
-    });
+    if (kind === "unreachable") {
+      RELAY_STATE.healthy = false;
+      // supervisor usually respawns within seconds — one healed retry
+      if (await healRelay()) {
+        try {
+          relayResp = await fetch(url, init);
+          const meta2 = assembleBareMeta(relayResp.headers);
+          if (meta2 !== null || relayResp.headers.get("x-bare-status") !== null || relayResp.status === 304) {
+            // recovered — fall through with the fresh response
+            return await unwrapBareResponse(event, request, target, jar, relayResp);
+          }
+        } catch (e) {
+          /* still down */
+        }
+      }
+    }
+    throw new RelayError(kind, code, message);
   }
 
+  return await unwrapBareResponse(event, request, target, jar, relayResp);
+}
+
+/** Unwraps the bare-v3 envelope of a SUCCESSFUL relay response into the
+ * response the page expects (status/headers/cookies/redirect rewriting). */
+async function unwrapBareResponse(event, request, target, jar, relayResp) {
   // ── unwrap bare meta ─────────────────────────────────────────
   let meta = {};
   try {
+    const metaRaw = assembleBareMeta(relayResp.headers);
     meta = metaRaw ? JSON.parse(metaRaw) : {};
   } catch (e) {
     meta = {};
@@ -583,9 +706,23 @@ async function directStyle(event, real, jar) {
   return new Response(css, { status: resp.status, statusText: resp.statusText, headers });
 }
 
-/* ── readable failure page (documents) with one silent auto-retry ── */
+/* ── readable failure page (documents) with one silent auto-retry ──
+ * `err` is usually a classified RelayError: unreachable (relay restarting),
+ * upstream (the site refused the relay's connection) or a bare protocol
+ * code. Honest text per class — never a raw protocol JSON. */
 function errorPage(real, err) {
-  const message = String((err && (err.message || err)) || "unknown error").replace(/[<>&]/g, "");
+  const kind = (err && err.kind) || "";
+  const code = String((err && err.code) || "");
+  const raw = String((err && (err.message || err)) || "unknown error").replace(/[<>&]/g, "");
+  let headline = "◈ Relay could not fetch this page";
+  let note = "The site may be rejecting relays (anti-bot) or the secure relay is restarting — retrying usually fixes it. Nothing about this attempt was logged.";
+  if (kind === "unreachable" || code === "relay_unreachable") {
+    headline = "◈ Secure relay is restarting";
+    note = "The encrypted relay is recovering automatically (a few seconds). This page auto-retries once — if it is still down, press Retry. Nothing was logged.";
+  } else if (kind === "upstream" || /UPSTREAM|FETCH|SOCKET|DNS|ECONN/i.test(code)) {
+    headline = "◈ Site unreachable through the relay";
+    note = "The site refused or dropped the relay's connection (anti-bot or datacenter-IP policy). Retrying sometimes helps; some sites only work from residential networks.";
+  }
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Specter — site unreachable</title><style>
 html,body{margin:0;height:100%;background:#09090b;color:#e4e4e7;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
 .wrap{max-width:560px;margin:0 auto;padding:48px 24px}
@@ -596,9 +733,9 @@ button{margin-top:22px;border:1px solid #10b981;background:transparent;color:#6e
 button:hover{background:rgba(16,185,129,.12)}
 .note{margin-top:18px;font-size:12px;color:#71717a}
 </style></head><body><div class="wrap">
-<h1>◈ Relay could not fetch this page</h1>
-<p><code>${message.slice(0, 240)}</code></p>
-<p class="note">The site may be rejecting relays (anti-bot) or the secure relay is restarting — retrying usually fixes it. Nothing about this attempt was logged.</p>
+<h1>${headline}</h1>
+<p><code>${(code ? code + " — " : "") + raw.slice(0, 240)}</code></p>
+<p class="note">${note}</p>
 <button onclick="location.reload()">Retry now</button>
 <script>(function(){try{var k="specter:autoRetry";var n=Number(sessionStorage.getItem(k))||0;if(n<1){sessionStorage.setItem(k,String(n+1));setTimeout(function(){location.reload()},1400)}}catch(e){}})();<\/script>
 </div></body></html>`;
@@ -1002,6 +1139,33 @@ async function runSelfTest() {
         throw new Error("client hook not injected");
       }
       return "HTML rewritten + client hook injected";
+    })
+  );
+
+  results.push(
+    await selfTestStep("relay_error_classification", async () => {
+      /* Regression test for the generic "relay_error" bug: a refused upstream
+       * must surface as a CLASSIFIED RelayError (kind=upstream + the real
+       * bare code), and document navigations must never render a raw
+       * protocol JSON. Port 1 → ECONNREFUSED. */
+      const real = "http://127.0.0.1:1/nope";
+      const enc = __uv$config.encodeUrl(real);
+      const req = new Request(location.origin + __uv$config.prefix + enc);
+      const ev = { request: req, clientId: "", waitUntil() {}, respondWith() {} };
+      const jar = await openCookieJar(real);
+      let caught = null;
+      try {
+        await directBareFetch(ev, real, jar);
+      } catch (e) {
+        caught = e;
+      }
+      if (!caught) throw new Error("upstream refusal did not throw");
+      if (caught.name !== "RelayError") throw new Error("unclassified: " + caught.name);
+      if (caught.kind !== "upstream") throw new Error("kind=" + caught.kind);
+      if (!caught.code || caught.code === "relay_error") {
+        throw new Error("generic code survived: " + caught.code);
+      }
+      return "RelayError kind=upstream code=" + caught.code;
     })
   );
 

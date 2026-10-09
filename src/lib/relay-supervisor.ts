@@ -28,6 +28,22 @@ function relayUp(): Promise<boolean> {
 }
 
 let starting = false;
+let announcedUp = false;
+
+/** Wait until the relay port answers (spawn is async). */
+function waitUntilUp(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise<boolean>((resolve) => {
+    const tick = () => {
+      void relayUp().then((up) => {
+        if (up) return resolve(true);
+        if (Date.now() > deadline) return resolve(false);
+        setTimeout(tick, 300);
+      });
+    };
+    tick();
+  });
+}
 
 function spawnRelay() {
   if (starting) return;
@@ -45,20 +61,29 @@ function spawnRelay() {
     });
     child.on("exit", (code) => {
       starting = false;
+      announcedUp = false;
       console.log(`[relay-supervisor] relay exited (code=${code}) — watching for recovery`);
       setTimeout(() => {
         void relayUp().then((up) => {
           if (!up) spawnRelay();
         });
-      }, 1500);
+      }, 1000);
     });
     child.on("error", (err) => {
       starting = false;
+      announcedUp = false;
       console.error("[relay-supervisor] spawn failed:", err.message);
     });
     console.log("[relay-supervisor] spawned bare relay (child of next-server)");
+    void waitUntilUp(10_000).then((up) => {
+      if (up && !announcedUp) {
+        announcedUp = true;
+        console.log("[relay-supervisor] relay healthy on :3030");
+      }
+    });
   } catch (err) {
     starting = false;
+    announcedUp = false;
     console.error("[relay-supervisor] unexpected spawn error:", err);
   }
 }
@@ -68,10 +93,13 @@ export function startRelaySupervisor() {
     if (!up) spawnRelay();
     else console.log("[relay-supervisor] relay already up on :3030");
   });
+  // 5s guard: keeps the relay-down window (and therefore user-visible relay
+  // errors) as short as possible; the service worker additionally probes and
+  // retries through the restart window.
   const guard = setInterval(() => {
     void relayUp().then((up) => {
       if (!up) spawnRelay();
     });
-  }, 15_000);
+  }, 5_000);
   guard.unref?.();
 }
