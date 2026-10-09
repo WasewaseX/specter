@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   ArrowRight,
   BookOpen,
+  Download,
   House,
   Lock,
   RotateCw,
@@ -12,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import DownloaderPanel from "@/components/specter/downloader-panel";
 import { useSpecter } from "@/store/specter";
 
 /**
@@ -29,6 +31,7 @@ export default function BrowserBar() {
   const dataSaver = useSpecter((s) => s.dataSaver);
   const uvAvailable = useSpecter((s) => s.uvAvailable);
   const newTab = useSpecter((s) => s.newTab);
+  const mediaCount = useSpecter((s) => (s.activeTabId ? s.mediaByTab[s.activeTabId]?.length ?? 0 : 0));
 
   const active = tabs.find((t) => t.id === activeTabId);
   if (!active || active.kind !== "web") return null;
@@ -45,6 +48,7 @@ export default function BrowserBar() {
     readerOn={readerOn}
     dataSaver={dataSaver}
     uvAvailable={uvAvailable}
+    mediaCount={mediaCount}
     onBack={() => void tabGo(-1)}
     onForward={() => void tabGo(1)}
     onReload={() => void tabReload()}
@@ -62,6 +66,7 @@ function BrowserBarInner(props: {
   readerOn: boolean;
   dataSaver: boolean;
   uvAvailable: boolean;
+  mediaCount: number;
   onBack: () => void;
   onForward: () => void;
   onReload: () => void;
@@ -71,6 +76,7 @@ function BrowserBarInner(props: {
 }) {
   const [address, setAddress] = useState(props.url ?? "");
   const [syncedUrl, setSyncedUrl] = useState(props.url);
+  const [downloaderOpen, setDownloaderOpen] = useState(false);
 
   // adjust state on prop change (React recommended pattern)
   if (props.url !== syncedUrl) {
@@ -79,7 +85,7 @@ function BrowserBarInner(props: {
   }
 
   return (
-    <div className="flex h-11 shrink-0 items-center gap-1 border-b border-zinc-800/80 bg-zinc-950/95 px-1.5 md:gap-1.5 md:px-2.5">
+    <div className="relative flex h-11 shrink-0 items-center gap-1 border-b border-zinc-800/80 bg-zinc-950/95 px-1.5 md:gap-1.5 md:px-2.5">
       <Button
         variant="ghost"
         size="icon"
@@ -163,6 +169,32 @@ function BrowserBarInner(props: {
           {props.uvAvailable ? "FULL BROWSER" : "GHOST"}
         </span>
       </form>
+
+      {/* built-in downloader (Min feature) */}
+      <Button
+        variant="ghost"
+        size="icon"
+        className={`relative size-9 ${downloaderOpen ? "text-emerald-300" : "text-zinc-400"}`}
+        onClick={() => setDownloaderOpen((v) => !v)}
+        aria-pressed={downloaderOpen}
+        aria-label={
+          downloaderOpen
+            ? "Close the downloader"
+            : `Downloader — ${props.mediaCount} media source${props.mediaCount === 1 ? "" : "s"} found on this page`
+        }
+      >
+        <Download aria-hidden="true" />
+        {props.mediaCount > 0 && !downloaderOpen ? (
+          <span
+            aria-hidden="true"
+            className="absolute -right-0.5 -top-0.5 flex min-w-4 items-center justify-center rounded-full bg-emerald-400 px-1 font-mono text-[8px] font-bold leading-4 text-zinc-950"
+          >
+            {props.mediaCount > 9 ? "9+" : props.mediaCount}
+          </span>
+        ) : null}
+      </Button>
+
+      {downloaderOpen ? <DownloaderPanel onClose={() => setDownloaderOpen(false)} /> : null}
 
       {/* reader mode (Min feature) */}
       <Button

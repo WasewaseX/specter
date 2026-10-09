@@ -55,6 +55,14 @@ export interface BrowserTab {
   nonce: number;
 }
 
+/** A downloadable media/file source discovered on a page (RAM only). */
+export interface MediaItem {
+  /** real (unproxied) URL */
+  u: string;
+  /** video | audio | file */
+  k: string;
+}
+
 export interface BrowserStats {
   blocked: number;
   imagesCompressed: number;
@@ -93,6 +101,8 @@ interface SpecterState {
   adBlock: boolean;
   readerOn: boolean;
   stats: BrowserStats;
+  /** discovered downloadable sources per tab id (built-in downloader) */
+  mediaByTab: Record<string, MediaItem[]>;
 
   // ── privacy drawer ─────────────────────────────────────────
   drawerOpen: boolean;
@@ -240,6 +250,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   adBlock: true,
   readerOn: false,
   stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },
+  mediaByTab: {},
 
   drawerOpen: false,
 
@@ -365,7 +376,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   },
 
   closeTab: (id) => {
-    const { tabs, activeTabId } = get();
+    const { tabs, activeTabId, mediaByTab } = get();
     const idx = tabs.findIndex((t) => t.id === id);
     if (idx === -1) return;
     const next = tabs.filter((t) => t.id !== id);
@@ -379,7 +390,9 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       const neighbor = next[Math.min(idx, next.length - 1)];
       nextActive = neighbor.id;
     }
-    set({ tabs: next, activeTabId: nextActive, readerOn: false });
+    const mediaNext = { ...mediaByTab };
+    delete mediaNext[id];
+    set({ tabs: next, activeTabId: nextActive, readerOn: false, mediaByTab: mediaNext });
   },
 
   activateTab: (id) => {
@@ -439,6 +452,8 @@ export const useSpecter = create<SpecterState>((set, get) => ({
     if (!active) return;
 
     const stack = [...active.history.slice(0, active.historyIndex + 1), url];
+    const mediaNext = { ...get().mediaByTab };
+    delete mediaNext[activeTabId];
     const tabs2 = tabs.map((t) =>
       t.id === activeTabId
         ? {
@@ -454,7 +469,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
           }
         : t
     );
-    set({ tabs: tabs2, readerOn: false });
+    set({ tabs: tabs2, readerOn: false, mediaByTab: mediaNext });
   },
 
   tabGo: async (delta) => {
@@ -625,6 +640,21 @@ export const useSpecter = create<SpecterState>((set, get) => ({
 
     if (type === "video-deferred") {
       get().addStats({ videosDeferred: 1 });
+      return;
+    }
+
+    /* downloader discovery: the injected hook reports downloadable sources */
+    if (type === "media" && Array.isArray(data.items)) {
+      const items: MediaItem[] = (data.items as Array<Record<string, unknown>>)
+        .filter(
+          (it): it is { u: string; k: string } =>
+            typeof it?.u === "string" && /^https?:/i.test(it.u) && typeof it?.k === "string"
+        )
+        .slice(0, 60)
+        .map((it) => ({ u: it.u, k: it.k }));
+      if (!items.length) return;
+      set({ mediaByTab: { ...get().mediaByTab, [activeTabId]: items } });
+      return;
     }
   },
 
@@ -742,6 +772,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       activeTabId: fresh.id,
       readerOn: false,
       stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },
+      mediaByTab: {},
       drawerOpen: false,
       vaultExists: false,
       vaultUnlocked: false,

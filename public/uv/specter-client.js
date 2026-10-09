@@ -22,6 +22,13 @@
  *  5. YouTube rescue — when YouTube's anti-datacenter bot wall blocks the
  *     /watch page, the hook offers a one-click switch to the embedded
  *     player (youtube-nocookie.com/embed), which plays without a login.
+ *  6. YouTube offline-error auto-recovery — if YouTube's client hits a
+ *     transient relay hiccup and renders its "Connect to the internet"
+ *     screen, the page silently reloads itself once; a stuck state can no
+ *     longer persist until a manual refresh.
+ *  7. Downloader discovery — video/audio/file sources found on the page
+ *     are reported to the browser chrome so the built-in downloader can
+ *     list them (RAM only, nothing persisted).
  *
  * Settings are read from localStorage("specter:settings") — the app chrome
  * (same origin) writes booleans there; the `storage` event updates live.
@@ -336,6 +343,128 @@
     }
   }
 
+  /* ── 6b. YouTube offline-error auto-recovery ──────────────────
+   * When the relay hiccups mid-session, YouTube's client can render its
+   * own "Connect to the internet / You're offline" screen even though the
+   * tunnel is healthy again. Reload once, silently — window.name survives
+   * reloads and acts as the loop guard. */
+  function youTubeOfflineRetry() {
+    try {
+      var u = realLocation();
+      if (!u || !/^www\.youtube(-nocookie)?\.com$/.test(u.hostname)) return;
+      var txt = document.body ? String(document.body.innerText).slice(0, 5000) : "";
+      if (!/connect to the internet|you.{0,3}re offline/i.test(txt)) return;
+      var parts = String(window.name || "").split("||");
+      var last = Number(parts[1]) || 0;
+      var now = Date.now();
+      if (now - last < 15000) return;
+      try {
+        window.name = "specter-offline||" + now;
+      } catch (e) {
+        /* ignore */
+      }
+      report({ type: "offline-retry" });
+      setTimeout(function () {
+        try {
+          location.reload();
+        } catch (e) {
+          /* ignore */
+        }
+      }, 900);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  /* ── 7. downloader discovery ──────────────────────────────────
+   * Resolve a page-relative / proxied / streaming URL back to the REAL
+   * address so the chrome's downloader can fetch it via /api/download. */
+  function realUrlFrom(src) {
+    try {
+      if (!src) return null;
+      var abs = new URL(src, location.origin).href;
+      var u = new URL(abs);
+      var prefix = "/service/";
+      try {
+        if (window.__uv$config && window.__uv$config.prefix) prefix = window.__uv$config.prefix;
+      } catch (e) {
+        /* default holds */
+      }
+      /* unwrap repeatedly — media elements can end up doubly wrapped
+       * (/api/stream?u=/api/stream%3Fu%3D…) after rewrites land in waves */
+      for (var depth = 0; depth < 4; depth++) {
+        if (u.pathname === "/api/stream" || u.pathname === "/api/download") {
+          var inner = u.searchParams.get("u");
+          if (!inner) return null;
+          u = new URL(decodeURIComponent(inner), location.origin);
+          continue;
+        }
+        if (u.pathname.indexOf(prefix) === 0) {
+          var real = decodeURIComponent(u.pathname.slice(prefix.length) + u.search);
+          if (!/^https?:/i.test(real)) return null;
+          u = new URL(real);
+          continue;
+        }
+        break;
+      }
+      if (/^https?:/i.test(u.href) && u.origin !== location.origin) return u.href;
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  var FILE_EXT = /\.(mp4|m4v|mkv|webm|mov|avi|mp3|m4a|aac|ogg|opus|wav|flac|zip|rar|7z|pdf|epub|apk|iso|exe|dmg|tar|gz)(\?|#|$)/i;
+
+  function collectMedia() {
+    var found = [];
+    function add(u, k) {
+      if (!u) return;
+      if (!/^https?:/i.test(u)) return;
+      if (found.length >= 60) return;
+      for (var i = 0; i < found.length; i++) if (found[i].u === u) return;
+      found.push({ u: u, k: k });
+    }
+    try {
+      var vids = document.querySelectorAll("video");
+      for (var i = 0; i < vids.length; i++) {
+        var v = vids[i];
+        add(realUrlFrom(v.currentSrc || v.src || v.getAttribute("src")), "video");
+        var sources = v.querySelectorAll("source");
+        for (var j = 0; j < sources.length; j++) add(realUrlFrom(sources[j].getAttribute("src")), "video");
+      }
+      var auds = document.querySelectorAll("audio");
+      for (var a = 0; a < auds.length; a++) {
+        var au = auds[a];
+        add(realUrlFrom(au.currentSrc || au.src || au.getAttribute("src")), "audio");
+        var asrcs = au.querySelectorAll("source");
+        for (var b = 0; b < asrcs.length; b++) add(realUrlFrom(asrcs[b].getAttribute("src")), "audio");
+      }
+      var anchors = document.querySelectorAll("a[href]");
+      for (var c = 0; c < anchors.length; c++) {
+        var real = realUrlFrom(anchors[c].href);
+        if (real && FILE_EXT.test(real)) add(real, "file");
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return found;
+  }
+
+  var lastMediaSig = "";
+  function reportMedia() {
+    try {
+      var list = collectMedia();
+      if (!list.length) return;
+      var sig = JSON.stringify(list);
+      if (sig === lastMediaSig) return;
+      lastMediaSig = sig;
+      report({ type: "media", items: list });
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
   var rescueDeadline = 0;
   function youTubeRescueCheck() {
     try {
@@ -358,6 +487,77 @@
     }
   }
 
+  /* ── 8. Cloudflare checkpoint notice ──────────────────────────
+   * Challenge pages ("Just a moment…") run proof-of-work code that detects
+   * relayed traffic; they usually cannot complete inside a proxy. Instead
+   * of a blank page, tell the user honestly and offer retry / direct-open
+   * (direct-open uses the user's own IP — their choice, never automatic). */
+  function checkpointNotice() {
+    try {
+      if (document.getElementById("specter-cf-note")) return;
+      var title = document.title || "";
+      var txt = document.body ? String(document.body.innerText).slice(0, 3000) : "";
+      var isChallenge =
+        /just a moment/i.test(title) ||
+        /checking your browser|attention required|verify you are human/i.test(txt) ||
+        !!document.getElementById("challenge-form") ||
+        !!document.getElementById("challenge-running");
+      if (!isChallenge) return;
+
+      var u = realLocation();
+      var realHref = u ? u.href : "";
+
+      var bar = document.createElement("div");
+      bar.id = "specter-cf-note";
+      bar.setAttribute("role", "status");
+      bar.style.cssText =
+        "position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483000;" +
+        "max-width:92vw;display:flex;flex-direction:column;gap:8px;padding:12px 14px;" +
+        "background:#0c1210;color:#d1fae5;border:1px solid #f59e0b;border-radius:10px;" +
+        "font:500 12px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;" +
+        "box-shadow:0 8px 28px rgba(0,0,0,.55)";
+      var line = document.createElement("div");
+      line.textContent =
+        "Cloudflare checkpoint — this site demands proof-of-work that server relays can't fake.";
+      line.style.cssText = "color:#fbbf24";
+      var row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:8px;align-items:center";
+      var retry = document.createElement("button");
+      retry.textContent = "↻ Retry through relay";
+      retry.style.cssText =
+        "border:0;border-radius:8px;padding:7px 12px;cursor:pointer;background:#10b981;color:#04110c;font-weight:700;font-size:12px";
+      retry.addEventListener("click", function () {
+        try {
+          location.reload();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+      var direct = document.createElement("a");
+      direct.textContent = "Open direct (uses your IP)";
+      if (realHref) {
+        direct.href = realHref;
+        direct.target = "_blank";
+        direct.rel = "noopener noreferrer";
+      }
+      direct.style.cssText =
+        "border:1px solid #374151;border-radius:8px;padding:6px 12px;cursor:pointer;" +
+        "background:transparent;color:#9ca3af;font-size:12px;text-decoration:none";
+      var note = document.createElement("div");
+      note.textContent =
+        "Some sites lower this wall for residential IPs — from your own network Specter may pass it without a challenge.";
+      note.style.cssText = "color:#6b7280;font-size:11px";
+      row.appendChild(retry);
+      row.appendChild(direct);
+      bar.appendChild(line);
+      bar.appendChild(row);
+      bar.appendChild(note);
+      (document.body || document.documentElement).appendChild(bar);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
   /* ── observer: debounced, never per-mutation work ───────────── */
   try {
     var sweepTimer = null;
@@ -372,6 +572,9 @@
          scrub-back served from cache), it never changes quality. */
       rewriteMediaSrcs();
       youTubeRescueCheck();
+      youTubeOfflineRetry();
+      reportMedia();
+      checkpointNotice();
       sendPage();
     }
     var observer = new MutationObserver(function () {

@@ -8,6 +8,7 @@ import {
   Github,
   Globe,
   Lock,
+  MonitorPlay,
   Newspaper,
   Search,
   ShieldCheck,
@@ -53,6 +54,7 @@ export default function NewTabHero() {
     { label: "Wikipedia", url: "https://en.wikipedia.org/wiki/Main_Page", icon: Newspaper },
     { label: "YouTube", url: "https://www.youtube.com", icon: Youtube },
     { label: "BBC News", url: "https://www.bbc.com/news", icon: Globe },
+    { label: "Iwara", url: "https://www.iwara.tv", icon: MonitorPlay },
     { label: "Hacker News", url: "https://news.ycombinator.com", icon: Globe },
     { label: "GitHub", url: "https://github.com", icon: Github },
     { label: "Wikivoyage", url: "https://en.wikivoyage.org/wiki/Main_Page", icon: Newspaper },
@@ -162,7 +164,7 @@ export default function NewTabHero() {
         <p className="mb-3 text-center font-mono text-[10px] uppercase tracking-[0.25em] text-zinc-600">
           Launch through the tunnel
         </p>
-        <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
           {tiles.map((tile) => (
             <button
               key={tile.label}
