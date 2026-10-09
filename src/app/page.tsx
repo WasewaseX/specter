@@ -25,6 +25,10 @@ export default function Home() {
   const recordBlocked = useSpecter((s) => s.recordBlocked);
   const setSelfTest = useSpecter((s) => s.setSelfTest);
   const setNetLegs = useSpecter((s) => s.setNetLegs);
+  const setCompatStart = useSpecter((s) => s.setCompatStart);
+  const setCompatResult = useSpecter((s) => s.setCompatResult);
+  const setCompatDone = useSpecter((s) => s.setCompatDone);
+  const setCacheHits = useSpecter((s) => s.setCacheHits);
 
   useEffect(() => {
     void boot();
@@ -46,6 +50,10 @@ export default function Home() {
         // streaming = only what was watched; browser cache serves replays)
         const bytes = Number(data.bytes) || 0;
         if (bytes > 0) useSpecter.getState().addStats({ mediaBytes: bytes });
+      } else if (data.type === "specter:cache") {
+        // static resources served from the engine's RAM cache
+        const hits = Number(data.hits) || 0;
+        if (hits > 0) setCacheHits(hits);
       } else if (data.type === "specter:selftest" && Array.isArray(data.results)) {
         setSelfTest({
           results: data.results as { name: string; pass: boolean; detail: string; ms: number }[],
@@ -54,13 +62,52 @@ export default function Home() {
         });
       } else if (data.type === "specter:netlegs") {
         setNetLegs({
-          legA: typeof data.legA === "number" ? data.legA : null,
-          legB: typeof data.legB === "number" ? data.legB : null,
-          kbps: typeof data.kbps === "number" ? data.kbps : null,
-          probeBytes: typeof data.probeBytes === "number" ? data.probeBytes : 0,
+          legA: (data.legA as { median: number | null; min: number | null; max: number | null; n: number; failures: number } | null) ?? null,
+          legB: (data.legB as { median: number | null; min: number | null; max: number | null; n: number; failures: number } | null) ?? null,
+          ttfbMs: typeof data.ttfbMs === "number" ? data.ttfbMs : null,
+          downSmall: (data.downSmall as { kbps: number | null; bytes: number; error?: string | null } | null) ?? null,
+          downLarge: (data.downLarge as { kbps: number | null; bytes: number; error?: string | null } | null) ?? null,
           error: typeof data.error === "string" ? data.error : null,
           ts: Number(data.ts) || Date.now(),
         });
+      } else if (data.type === "specter:compat") {
+        const phase = String(data.phase || "");
+        if (phase === "start") {
+          setCompatStart(typeof data.rev === "string" ? data.rev : null, Number(data.ts) || Date.now());
+        } else if (phase === "result" && data.result && typeof data.result === "object") {
+          const r = data.result as Record<string, unknown>;
+          const summary = (data.summary ?? {}) as Record<string, unknown>;
+          useSpecter.getState().setCompatResult(
+            {
+              id: String(r.id ?? ""),
+              name: String(r.name ?? r.id ?? "test"),
+              status:
+                r.status === "pass" || r.status === "wall" || r.status === "skip" ? r.status : "fail",
+              cls: r.cls === "network" || r.cls === "upstream" ? r.cls : "code",
+              detail: String(r.detail ?? ""),
+              ms: Number(r.ms) || 0,
+            },
+            {
+              pass: Number(summary.pass) || 0,
+              wall: Number(summary.wall) || 0,
+              fail: Number(summary.fail) || 0,
+              skip: Number(summary.skip) || 0,
+              total: Number(summary.total) || 0,
+            }
+          );
+        } else if (phase === "done" && data.summary && typeof data.summary === "object") {
+          const summary = data.summary as Record<string, unknown>;
+          setCompatDone(
+            {
+              pass: Number(summary.pass) || 0,
+              wall: Number(summary.wall) || 0,
+              fail: Number(summary.fail) || 0,
+              skip: Number(summary.skip) || 0,
+              total: Number(summary.total) || 0,
+            },
+            Number(data.ts) || Date.now()
+          );
+        }
       } else if (data.type === "specter:relay-debug") {
         // transport-level failure diagnostics (code + envelope size) —
         // surfaced in the console only; nothing is persisted (RAM-only rule)
@@ -77,7 +124,7 @@ export default function Home() {
       }
     });
     return unsubscribe;
-  }, [recordBlocked, setSelfTest, setNetLegs]);
+  }, [recordBlocked, setSelfTest, setNetLegs, setCompatStart, setCompatResult, setCompatDone, setCacheHits]);
 
   // messages from injected page hooks: address-bar sync + popup → tab
   useEffect(() => {

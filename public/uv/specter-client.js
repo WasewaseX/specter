@@ -561,6 +561,65 @@
     }
   }
 
+  /* ── 9. Google sign-in wall notice (honest, per user report) ──
+   * Google refuses COMPLETED sign-ins from relayed/automated browsers:
+   * "Couldn't sign you in — This browser or app may not be secure." That
+   * is Google's anti-automation policy on the SITE side, not a SPECTER
+   * bug. Instead of a dead end, say exactly that and what the options
+   * are (browse unsigned / residential relay). */
+  function googleSignInNotice() {
+    try {
+      if (document.getElementById("specter-signin-note")) return;
+      var u = realLocation();
+      if (!u) return;
+      var host = u.hostname || "";
+      var onAuthPage = /(^|\.)accounts\.google\.[a-z.]+$/.test(host) ||
+        (/youtube\.com$/.test(host) && /signin|signin|login/i.test(u.pathname || ""));
+      if (!onAuthPage) return;
+      var txt = document.body ? String(document.body.innerText).slice(0, 4000) : "";
+      var hit = /couldn.{0,3}t sign you in|this browser or app may not be secure/i.test(txt);
+      if (!hit) return;
+
+      var bar = document.createElement("div");
+      bar.id = "specter-signin-note";
+      bar.setAttribute("role", "status");
+      bar.style.cssText =
+        "position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483000;" +
+        "max-width:92vw;display:flex;flex-direction:column;gap:8px;padding:12px 14px;" +
+        "background:#0c1210;color:#d1fae5;border:1px solid #f59e0b;border-radius:10px;" +
+        "font:500 12px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;" +
+        "box-shadow:0 8px 28px rgba(0,0,0,.55)";
+      var line = document.createElement("div");
+      line.textContent =
+        "Google blocks sign-in from relayed browsers — its own anti-automation policy, not a Specter bug.";
+      line.style.cssText = "color:#fbbf24";
+      var note = document.createElement("div");
+      note.textContent =
+        "Browsing stays fully usable without signing in. Sign-in (and some playback) follows Google's normal rules on residential relays.";
+      note.style.cssText = "color:#9ca3af;font-size:11px";
+      var close = document.createElement("button");
+      close.textContent = "✕";
+      close.setAttribute("aria-label", "Dismiss");
+      close.style.cssText =
+        "position:absolute;top:6px;right:8px;border:0;background:transparent;color:#6ee7b7;font-size:13px;cursor:pointer;padding:4px";
+      close.addEventListener("click", function () {
+        try {
+          bar.remove();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+      bar.style.position = "fixed";
+      bar.appendChild(close);
+      bar.appendChild(line);
+      bar.appendChild(note);
+      (document.body || document.documentElement).appendChild(bar);
+      report({ type: "signin-wall-shown" });
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
   /* ── observer: debounced, never per-mutation work ───────────── */
   try {
     var sweepTimer = null;
@@ -578,6 +637,7 @@
       youTubeOfflineRetry();
       reportMedia();
       checkpointNotice();
+      googleSignInNotice();
       sendPage();
     }
     var observer = new MutationObserver(function () {

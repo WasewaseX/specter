@@ -268,3 +268,36 @@ export function startRelaySupervisor() {
   };
   setTimeout(watchdog, 5_000);
 }
+
+/**
+ * Deliberately restart the relay (used by the in-product compatibility
+ * suite's recovery drill): kill whatever listens on :3030, respawn the
+ * node relay, wait for health. The engine transport is expected to heal
+ * through this without any user action — that is exactly what the drill
+ * verifies. Never called automatically; the watchdog above only spawns.
+ */
+export async function restartRelay(): Promise<{
+  ok: boolean;
+  runtime?: string;
+  pid?: number;
+  error?: string;
+}> {
+  const pids = pidsOnPort(RELAY_PORT);
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  await waitUntilDown(4_000);
+  if (!starting) spawnRelay();
+  const up = await waitUntilUp(12_000);
+  if (!up) return { ok: false, error: "relay did not come back within 12s" };
+  const ident = await relayIdentity();
+  if (!ident || ident.runtime !== "node") {
+    return { ok: false, error: "relay came back with the wrong runtime" };
+  }
+  console.log(`[relay-supervisor] deliberate restart complete (node, pid=${ident.pid ?? "?"})`);
+  return { ok: true, runtime: ident.runtime, pid: ident.pid };
+}

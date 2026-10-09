@@ -8,6 +8,7 @@
  *   redirect  302 → echo?via=redirect           (redirect following)
  *   pix.png   67-byte PNG                       (binary/image passthrough)
  *   media     4 KB Range-capable fake mp4       (206 partial content)
+ *   bigfile   1–8 MB Range-capable blob         (cancel/resume + starvation drills)
  *   download  attachment headers + 2 KB         (download header fidelity)
  *   page      tiny HTML doc                     (Ultraviolet rewrite path)
  *
@@ -85,6 +86,59 @@ function rangeResponse(req: NextRequest): NextResponse {
   });
 }
 
+/** Deterministic pseudo-random payload (no allocation randomness cost). */
+function fillPattern(buf: Buffer) {
+  for (let i = 0; i < buf.length; i++) buf[i] = (i * 31 + 17) % 251;
+  return buf;
+}
+
+function bigFileResponse(req: NextRequest): NextResponse {
+  const requested = Number(req.nextUrl.searchParams.get("bytes")) || 2_000_000;
+  const total = Math.max(1024, Math.min(requested, 8_388_608));
+  const range = req.headers.get("range");
+  if (!range) {
+    const buf = fillPattern(Buffer.alloc(total));
+    return new NextResponse(new Uint8Array(buf), {
+      status: 200,
+      headers: {
+        "content-type": "application/octet-stream",
+        "accept-ranges": "bytes",
+        "content-length": String(total),
+        "cache-control": "no-store",
+      },
+    });
+  }
+  const m = /bytes=(\d+)-(\d*)/.exec(range);
+  if (!m) {
+    return new NextResponse(null, {
+      status: 416,
+      headers: { "content-range": `bytes */${total}` },
+    });
+  }
+  const start = Number(m[1]);
+  const end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
+  if (!Number.isFinite(start) || start > end || start >= total) {
+    return new NextResponse(null, {
+      status: 416,
+      headers: { "content-range": `bytes */${total}` },
+    });
+  }
+  const len = end - start + 1;
+  const slice = fillPattern(Buffer.alloc(len));
+  // each byte still matches the full-file pattern so resumed slices align
+  for (let i = 0; i < len; i++) slice[i] = ((start + i) * 31 + 17) % 251;
+  return new NextResponse(new Uint8Array(slice), {
+    status: 206,
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-range": `bytes ${start}-${end}/${total}`,
+      "content-length": String(len),
+      "accept-ranges": "bytes",
+      "cache-control": "no-store",
+    },
+  });
+}
+
 async function dispatch(req: NextRequest, seg: string): Promise<NextResponse> {
   switch (seg) {
     case "echo": {
@@ -107,6 +161,8 @@ async function dispatch(req: NextRequest, seg: string): Promise<NextResponse> {
       });
     case "media":
       return rangeResponse(req);
+    case "bigfile":
+      return bigFileResponse(req);
     case "download":
       return new NextResponse(new Uint8Array(DOWNLOAD_BYTES), {
         status: 200,

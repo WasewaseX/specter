@@ -73,17 +73,52 @@ export interface SelfTestResult {
   ms: number;
 }
 
-/** Two-leg network speed measurement (review recommendation #1, RAM only). */
-export interface NetLegsResult {
-  /** browser → preview edge round-trip, ms (median of 4) */
-  legA: number | null;
-  /** preview relay → open internet round-trip, ms (median of 4) */
-  legB: number | null;
-  /** sustained download through the relay, KB/s */
+/** Two-leg network speed measurement v2 (review Priority 2, RAM only). */
+export interface SpeedSample {
+  median: number | null;
+  min: number | null;
+  max: number | null;
+  n: number;
+  failures: number;
+}
+export interface DownSample {
   kbps: number | null;
-  probeBytes: number;
+  bytes: number;
+  error?: string | null;
+}
+export interface NetLegsResult {
+  /** browser → preview edge: 6 probes, median + spread + failures */
+  legA: SpeedSample | null;
+  /** preview relay → open internet: 6 full-pipeline probes + TTFB */
+  legB: SpeedSample | null;
+  /** median time-to-first-byte of leg B probes (ms) */
+  ttfbMs: number | null;
+  /** small-file (100 KB) sustained download through the relay */
+  downSmall: DownSample | null;
+  /** larger-file (1 MB) sustained download through the relay */
+  downLarge: DownSample | null;
   error: string | null;
   ts: number;
+}
+
+/** One live-site compatibility test result (review Priority 1, RAM only).
+ *  status: pass = the real function worked; wall = the SITE refused
+ *  (upstream policy); fail = the pipeline broke (code or network — cls
+ *  distinguishes); skip = could not run this time. */
+export interface CompatResult {
+  id: string;
+  name: string;
+  status: "pass" | "fail" | "wall" | "skip";
+  cls: "code" | "network" | "upstream";
+  detail: string;
+  ms: number;
+}
+export interface CompatSummary {
+  pass: number;
+  wall: number;
+  fail: number;
+  skip: number;
+  total: number;
 }
 
 /** Lifecycle of the Ghost Browser engine (never silently ambiguous). */
@@ -96,6 +131,8 @@ export interface BrowserStats {
   videosDeferred: number;
   /** bytes actually streamed for video/audio (Range = only what was watched) */
   mediaBytes: number;
+  /** static resources served from the engine's RAM cache (zero re-download) */
+  cacheHits: number;
 }
 
 type SearchPhase = "idle" | "searching" | "done" | "error";
@@ -147,6 +184,21 @@ interface SpecterState {
     running: boolean;
     result: NetLegsResult | null;
   };
+  /** live-site compatibility suite (streams results as they finish) */
+  compatSuite: {
+    running: boolean;
+    results: CompatResult[];
+    summary: CompatSummary | null;
+    rev: string | null;
+    ts: number | null;
+  };
+  /** relay heartbeat (app-level honesty about the relay process) */
+  relayHealth: "ok" | "down";
+  /** reopen tabs across a page refresh — sessionStorage only (RAM-scoped,
+   *  dies with the browser, wiped by Panic Wipe). Off = pure RAM browser. */
+  sessionRestoreOn: boolean;
+  /** true right after tabs were restored from a refresh snapshot */
+  sessionRestored: boolean;
   dataSaver: boolean;
   adBlock: boolean;
   readerOn: boolean;
@@ -209,6 +261,16 @@ interface SpecterState {
   setNetLegs: (r: NetLegsResult) => void;
   /** Run the engine's two-leg speed check. */
   runNetLegs: () => void;
+  /** Run the engine's live-site compatibility suite. */
+  runCompatSuite: () => void;
+  /** Suite lifecycle from the engine SW. */
+  setCompatStart: (rev: string | null, ts: number) => void;
+  setCompatResult: (result: CompatResult, summary: CompatSummary) => void;
+  setCompatDone: (summary: CompatSummary, ts: number) => void;
+  /** Absolute cache-hit counter from the engine SW. */
+  setCacheHits: (hits: number) => void;
+  /** Toggle refresh-session restore (RAM-scoped snapshot). */
+  setSessionRestoreOn: (v: boolean) => void;
 
   createVault: (pass: string, confirm: string) => Promise<string | null>;
   unlockVault: (pass: string) => Promise<string | null>;
@@ -270,6 +332,156 @@ function hostOf(url: string): string {
   }
 }
 
+/* ── session restore (refresh recovery, Priority 5) ─────────────
+ * Tabs survive a PAGE REFRESH via sessionStorage: RAM-scoped storage that
+ * dies with the browser tab, never synced, never leaves the device, and
+ * wiped by Panic Wipe. This is deliberately NOT localStorage — closing
+ * the browser destroys it, which keeps the zero-trace promise while still
+ * making a refresh non-destructive. Contains tab URLs/titles only. */
+const SNAPSHOT_KEY = "specter:snapshot";
+
+function loadSessionRestoreOn(): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    const raw = window.localStorage.getItem("specter:settings");
+    if (!raw) return true;
+    const j = JSON.parse(raw) as { sessionRestore?: boolean };
+    return j.sessionRestore !== false;
+  } catch {
+    return true;
+  }
+}
+
+interface SnapshotShape {
+  v: 1;
+  ts: number;
+  activeTabId: string | null;
+  tabs: Array<Pick<BrowserTab, "id" | "kind" | "title" | "url" | "query" | "history" | "historyIndex">>;
+  mediaByTab: Record<string, MediaItem[]>;
+}
+
+function saveSnapshot(state: SpecterState) {
+  if (typeof window === "undefined" || !state.sessionRestoreOn) return;
+  try {
+    const snap: SnapshotShape = {
+      v: 1,
+      ts: Date.now(),
+      activeTabId: state.activeTabId,
+      tabs: state.tabs.slice(0, 20).map((t) => ({
+        id: t.id,
+        kind: t.kind,
+        title: t.title,
+        url: t.url,
+        query: t.query,
+        history: t.history.slice(-12),
+        historyIndex: Math.min(t.historyIndex, 11),
+      })),
+      mediaByTab: state.mediaByTab,
+    };
+    window.sessionStorage.setItem(SNAPSHOT_KEY, JSON.stringify(snap));
+  } catch {
+    /* storage unavailable — RAM-only mode holds */
+  }
+}
+
+let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSnapshot() {
+  if (typeof window === "undefined") return;
+  if (snapshotTimer) clearTimeout(snapshotTimer);
+  snapshotTimer = setTimeout(() => {
+    snapshotTimer = null;
+    saveSnapshot(useSpecter.getState());
+  }, 400);
+}
+
+function restoreSnapshot(): { tabs: BrowserTab[]; activeTabId: string | null; mediaByTab: Record<string, MediaItem[]> } | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(SNAPSHOT_KEY);
+    if (!raw) return null;
+    const snap = JSON.parse(raw) as SnapshotShape;
+    if (!snap || snap.v !== 1 || !Array.isArray(snap.tabs) || !snap.tabs.length) return null;
+    const tabs: BrowserTab[] = snap.tabs.slice(0, 20).map((t) => ({
+      id: typeof t.id === "string" ? t.id : freshTabId(),
+      kind: t.kind === "web" || t.kind === "search" ? t.kind : "newtab",
+      title: typeof t.title === "string" ? t.title : "New Tab",
+      url: typeof t.url === "string" ? t.url : null,
+      query: typeof t.query === "string" ? t.query : null,
+      history: Array.isArray(t.history) ? t.history.filter((h) => typeof h === "string").slice(-12) : [],
+      historyIndex: typeof t.historyIndex === "number" ? t.historyIndex : -1,
+      loading: false, // restored tabs reload lazily on activation
+      nonce: 1, // force a fresh iframe mount when the tab is shown
+    }));
+    const activeTabId =
+      typeof snap.activeTabId === "string" && tabs.some((t) => t.id === snap.activeTabId)
+        ? snap.activeTabId
+        : tabs[0].id;
+    const mediaByTab: Record<string, MediaItem[]> = {};
+    if (snap.mediaByTab && typeof snap.mediaByTab === "object") {
+      for (const [k, v] of Object.entries(snap.mediaByTab)) {
+        if (Array.isArray(v)) mediaByTab[k] = v.filter((m) => m && typeof m.u === "string").slice(0, 60);
+      }
+    }
+    return { tabs, activeTabId, mediaByTab };
+  } catch {
+    return null;
+  }
+}
+
+/* ── relay heartbeat (app-level recovery, Priority 5) ────────────
+ * The engine transport already self-heals; this app-level probe keeps the
+ * UI honest about the relay process and re-boots the ENGINE when the
+ * worker itself went stale. RAM-only state, tiny request, 30 s cadence. */
+type HeartbeatGlobal = { timer: ReturnType<typeof setInterval> | null; downs: number };
+const HEARTBEAT_KEY = "__specterRelayHeartbeat";
+function heartbeatState(): HeartbeatGlobal {
+  const g = globalThis as unknown as Record<string, unknown>;
+  if (!g[HEARTBEAT_KEY]) g[HEARTBEAT_KEY] = { timer: null, downs: 0 } as HeartbeatGlobal;
+  return g[HEARTBEAT_KEY] as HeartbeatGlobal;
+}
+function startRelayHeartbeat() {
+  if (typeof window === "undefined") return;
+  const hb = heartbeatState();
+  if (hb.timer) return;
+  hb.timer = setInterval(() => {
+    const store = useSpecter.getState();
+    // an engine boot in progress owns the wire — stay out of the way
+    if (store.uvStatus === "booting") return;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4000);
+    fetch("/bare/?XTransformPort=3030&hb=" + Date.now(), {
+      cache: "no-store",
+      signal: ctrl.signal,
+    })
+      .then((r) => {
+        clearTimeout(timer);
+        const ok = r.ok;
+        const down = heartbeatState().downs;
+        if (ok) {
+          heartbeatState().downs = 0;
+          if (store.relayHealth === "down") {
+            useSpecter.setState({ relayHealth: "ok" });
+          }
+          // relay is back but the engine was declared failed — bounded auto-recovery
+          if (store.uvStatus === "failed") void store.retryEngine();
+        } else {
+          heartbeatState().downs = down + 1;
+          if (down + 1 >= 2 && store.relayHealth === "ok") {
+            useSpecter.setState({ relayHealth: "down" });
+          }
+        }
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        const down = heartbeatState().downs;
+        heartbeatState().downs = down + 1;
+        if (down + 1 >= 2 && useSpecter.getState().relayHealth === "ok") {
+          useSpecter.setState({ relayHealth: "down" });
+        }
+      });
+  }, 30_000);
+}
+
 function looksLikeUrl(raw: string): boolean {
   const t = raw.trim();
   if (!t || /\s/.test(t)) return false;
@@ -319,6 +531,10 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   lastBlocked: null,
   selfTest: { running: false, results: null, rev: null, ts: null },
   netLegs: { running: false, result: null },
+  compatSuite: { running: false, results: [], summary: null, rev: null, ts: null },
+  relayHealth: "ok",
+  sessionRestoreOn: loadSessionRestoreOn(),
+  sessionRestored: false,
   /* Data Saver is strictly optional — OFF by default so every site renders at
    * full quality. Bandwidth efficiency never depended on it anyway: media is
    * Range-streamed (only watched seconds download) and trackers are blocked
@@ -326,7 +542,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   dataSaver: false,
   adBlock: true,
   readerOn: false,
-  stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },
+  stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0, cacheHits: 0 },
   mediaByTab: {},
 
   drawerOpen: false,
@@ -339,6 +555,14 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   // ── boot: fresh encrypted session (RAM-only) + browser engine ──
   boot: async () => {
     set({ booting: true });
+    // refresh recovery (Priority 5): rehydrate tabs from the RAM-scoped
+    // snapshot BEFORE anything renders so the browser reopens as it was
+    if (!get().sessionRestored) {
+      const snap = restoreSnapshot();
+      if (snap && get().sessionRestoreOn) {
+        set({ ...snap, sessionRestored: true });
+      }
+    }
     try {
       const key = await generateSessionKey();
       const raw = await exportKey(key);
@@ -368,7 +592,14 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       void pushUvSettings({ dataSaver, adBlock, bypassHosts });
     } else {
       set({ uvStatus: "failed", uvAvailable: false, uvError: uv.error });
+      // bounded auto-recovery: ONE silent retry after a short wait — the
+      // most common failure (relay mid-restart) heals itself; if it does
+      // not, the explicit offline screen with its retry button stays up.
+      setTimeout(() => {
+        if (get().uvStatus === "failed") void get().retryEngine();
+      }, 6000);
     }
+    startRelayHeartbeat();
   },
 
   retryEngine: async () => {
@@ -444,15 +675,77 @@ export const useSpecter = create<SpecterState>((set, get) => ({
             result: {
               legA: null,
               legB: null,
-              kbps: null,
-              probeBytes: 0,
+              ttfbMs: null,
+              downSmall: null,
+              downLarge: null,
               error: "engine SW did not answer — retry the browser engine",
               ts: Date.now(),
             },
           },
         });
       }
-    }, 30000);
+    }, 60000);
+  },
+
+  runCompatSuite: () => {
+    if (get().compatSuite.running) return;
+    set({ compatSuite: { running: true, results: [], summary: null, rev: null, ts: null } });
+    void postUvMessage({ type: "specter:compat" });
+    // bounded run: 13 tests × ≤45 s worst case — cap at 8 minutes
+    setTimeout(() => {
+      const cs = get().compatSuite;
+      if (cs.running) {
+        set({
+          compatSuite: {
+            ...cs,
+            running: false,
+            summary:
+              cs.summary ?? { pass: 0, wall: 0, fail: 0, skip: 0, total: cs.results.length + 1 },
+            ts: Date.now(),
+          },
+        });
+      }
+    }, 480000);
+  },
+
+  setCompatStart: (rev, ts) => {
+    set({ compatSuite: { running: true, results: [], summary: null, rev, ts } });
+  },
+
+  setCompatResult: (result, summary) => {
+    const cs = get().compatSuite;
+    set({
+      compatSuite: {
+        ...cs,
+        results: [...cs.results.filter((r) => r.id !== result.id), result],
+        summary,
+      },
+    });
+  },
+
+  setCompatDone: (summary, ts) => {
+    const cs = get().compatSuite;
+    set({ compatSuite: { ...cs, running: false, summary, ts } });
+  },
+
+  setCacheHits: (hits) => {
+    const s = get().stats;
+    if (hits > s.cacheHits) set({ stats: { ...s, cacheHits: hits } });
+  },
+
+  setSessionRestoreOn: (v) => {
+    set({ sessionRestoreOn: v });
+    if (typeof window !== "undefined") {
+      try {
+        if (!v) window.sessionStorage.removeItem(SNAPSHOT_KEY);
+        const raw = window.localStorage.getItem("specter:settings");
+        const j = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        j.sessionRestore = v;
+        window.localStorage.setItem("specter:settings", JSON.stringify(j));
+      } catch {
+        /* ignore */
+      }
+    }
   },
 
   runSelfTest: () => {
@@ -891,6 +1184,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
         bytesSaved: s.bytesSaved + (delta.bytesSaved ?? 0),
         videosDeferred: s.videosDeferred + (delta.videosDeferred ?? 0),
         mediaBytes: s.mediaBytes + (delta.mediaBytes ?? 0),
+        cacheHits: Math.max(s.cacheHits, delta.cacheHits ?? 0),
       },
     });
   },
@@ -939,6 +1233,12 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       // best effort
     }
     vaultWipe();
+    // the refresh snapshot is user-derived data — it dies too
+    try {
+      if (typeof window !== "undefined") window.sessionStorage.removeItem(SNAPSHOT_KEY);
+    } catch {
+      /* ignore */
+    }
     const fresh: BrowserTab = {
       id: freshTabId(),
       kind: "newtab",
@@ -966,8 +1266,9 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       tabs: [fresh],
       activeTabId: fresh.id,
       readerOn: false,
-      stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0 },
+      stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0, mediaBytes: 0, cacheHits: 0 },
       mediaByTab: {},
+      sessionRestored: false,
       drawerOpen: false,
       vaultExists: false,
       vaultUnlocked: false,
@@ -998,6 +1299,24 @@ if (typeof window !== "undefined") {
   } catch {
     /* ignore */
   }
+  // refresh recovery: persist the tab model (RAM-scoped sessionStorage)
+  // whenever tabs change — debounced, metadata only, never page content
+  let lastSig = "";
+  useSpecter.subscribe((state) => {
+    try {
+      const sig = JSON.stringify([
+        state.tabs.map((t) => [t.id, t.kind, t.title, t.url, t.historyIndex]),
+        state.activeTabId,
+        Object.keys(state.mediaByTab).length,
+      ]);
+      if (sig !== lastSig) {
+        lastSig = sig;
+        scheduleSnapshot();
+      }
+    } catch {
+      /* ignore */
+    }
+  });
 }
 
 export { shortSessionId };

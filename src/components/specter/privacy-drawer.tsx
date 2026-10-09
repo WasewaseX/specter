@@ -26,7 +26,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 import { useSpecter } from "@/store/specter";
-import type { NetLegsResult } from "@/store/specter";
+import type { NetLegsResult, SpeedSample } from "@/store/specter";
 import VaultPanel from "./vault-panel";
 
 function DefRow({ label, children }: { label: string; children: ReactNode }) {
@@ -90,6 +90,11 @@ export default function PrivacyDrawer() {
   const runSelfTest = useSpecter((s) => s.runSelfTest);
   const netLegs = useSpecter((s) => s.netLegs);
   const runNetLegs = useSpecter((s) => s.runNetLegs);
+  const compatSuite = useSpecter((s) => s.compatSuite);
+  const runCompatSuite = useSpecter((s) => s.runCompatSuite);
+  const sessionRestoreOn = useSpecter((s) => s.sessionRestoreOn);
+  const setSessionRestoreOn = useSpecter((s) => s.setSessionRestoreOn);
+  const relayHealth = useSpecter((s) => s.relayHealth);
   const panicWipe = useSpecter((s) => s.panicWipe);
   const { toast } = useToast();
 
@@ -152,12 +157,25 @@ export default function PrivacyDrawer() {
     runNetLegs();
   };
 
+  const handleRunCompat = () => {
+    if (uvStatus !== "ready") {
+      toast({
+        title: "Engine offline",
+        description: "The compatibility suite runs through the live engine.",
+      });
+      return;
+    }
+    runCompatSuite();
+  };
+
   const legVerdict = (r: NetLegsResult | null): { text: string; tone: string } => {
     if (!r) return { text: "", tone: "text-zinc-500" };
-    if (r.error && r.legA === null && r.legB === null)
+    const aMed = r.legA?.median ?? null;
+    const bMed = r.legB?.median ?? null;
+    if (r.error && aMed === null && bMed === null)
       return { text: "Measurement failed — " + r.error, tone: "text-red-300" };
-    const aSlow = r.legA !== null && r.legA > 800;
-    const bSlow = r.legB !== null && r.legB > 800;
+    const aSlow = aMed !== null && aMed > 800;
+    const bSlow = bMed !== null && bMed > 800;
     if (aSlow && !bSlow)
       return {
         text: "Leg A is the bottleneck: your connection to the SPECTER preview is slow. Compare the same site against your VPN — if the VPN is faster here, the preview host is the limiting factor.",
@@ -168,12 +186,20 @@ export default function PrivacyDrawer() {
         text: "Leg B is the bottleneck: the relay host's route to websites is slow. Engine tuning cannot change this — hosting the relay closer to you (or with better peering) would.",
         tone: "text-amber-300",
       };
-    if (r.legA !== null && r.legB !== null)
+    if (aMed !== null && bMed !== null)
       return {
         text: "Both legs are fast — if a specific site still feels slow, that site is pacing or rejecting relay traffic (anti-bot), not your link or the engine.",
         tone: "text-emerald-300",
       };
     return { text: "Partial measurement — " + (r.error ?? "some probes failed"), tone: "text-zinc-400" };
+  };
+
+  const fmtMs = (v: number | null) => (v !== null ? `${v} ms` : "—");
+  const sampleLine = (s: SpeedSample | null) => {
+    if (!s || s.median === null) return null;
+    const spread = s.min !== null && s.max !== null && s.max !== s.min ? ` (${s.min}–${s.max})` : "";
+    const fails = s.failures > 0 ? ` · ${s.failures} failed` : "";
+    return `${s.median} ms${spread} · n=${s.n}${fails}`;
   };
 
   const fmtBytes = (b: number) =>
@@ -279,6 +305,16 @@ export default function PrivacyDrawer() {
                   </span>
                 ) : (
                   <span className="text-red-400">DOWN</span>
+                )}
+              </DefRow>
+              <DefRow label="Relay heartbeat">
+                {relayHealth === "ok" ? (
+                  <span className="text-emerald-300">ALIVE (30 s probe)</span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 text-amber-300">
+                    <span aria-hidden="true" className="size-1.5 animate-pulse rounded-full bg-amber-400" />
+                    RECOVERING — transport self-heals
+                  </span>
                 )}
               </DefRow>
             </div>
@@ -408,7 +444,7 @@ export default function PrivacyDrawer() {
                 <div className="min-w-0">
                   <p className="text-xs text-zinc-200">RAM-only engine</p>
                   <p className="text-[11px] text-zinc-500">
-                    Tabs, history and stats live in memory only
+                    History and stats live in memory only
                   </p>
                 </div>
                 <Badge
@@ -417,6 +453,22 @@ export default function PrivacyDrawer() {
                 >
                   ALWAYS ON
                 </Badge>
+              </div>
+
+              <div className="flex items-center justify-between gap-4 border-b border-zinc-800/50 py-3">
+                <div className="min-w-0">
+                  <p className="text-xs text-zinc-200">Reopen tabs after refresh</p>
+                  <p className="text-[11px] text-zinc-500">
+                    Tab URLs survive a page refresh via RAM-scoped sessionStorage —
+                    dies with the browser, never synced, wiped by Panic Wipe.
+                  </p>
+                </div>
+                <Switch
+                  checked={sessionRestoreOn}
+                  onCheckedChange={setSessionRestoreOn}
+                  aria-label="Toggle reopen tabs after refresh"
+                  className="data-[state=checked]:bg-emerald-400"
+                />
               </div>
             </div>
           </section>
@@ -443,6 +495,106 @@ export default function PrivacyDrawer() {
               <DefRow label="Videos deferred (Data Saver)">
                 <span className="text-zinc-300">{stats.videosDeferred}</span>
               </DefRow>
+              <DefRow label="Static cache hits">
+                <span className="inline-flex items-center gap-1.5 text-emerald-300">
+                  <Zap className="size-3" aria-hidden="true" />
+                  {stats.cacheHits}
+                  <span className="text-[10px] text-zinc-500">repeat visits — zero re-download</span>
+                </span>
+              </DefRow>
+            </div>
+          </section>
+
+          {/* ── compatibility suite (live sites, real functions) ── */}
+          <section>
+            <SectionHeading>COMPATIBILITY SUITE — LIVE SITES</SectionHeading>
+            <div className="mt-2 rounded-lg border border-zinc-800/60 bg-zinc-900/40 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] leading-5 text-zinc-400">
+                  Tests REAL functions against REAL sites through the live
+                  engine: BBC documents + images, GitHub scripts/forms/login,
+                  YouTube search/watch/playback/sign-in separately,
+                  Cloudflare checkpoints, download cancel/resume,
+                  multi-tab starvation, relay-restart recovery. Each result
+                  says whether it broke in OUR code, the network, or was
+                  refused by the SITE itself. ~2 min, live traffic.
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleRunCompat}
+                  disabled={compatSuite.running}
+                  aria-label="Run live-site compatibility suite"
+                  className="shrink-0 bg-emerald-400 font-mono text-[10px] uppercase tracking-widest text-zinc-950 hover:bg-emerald-300"
+                >
+                  {compatSuite.running ? (
+                    <Loader2 className="mr-1 h-3 w-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Gauge className="mr-1 h-3 w-3" aria-hidden="true" />
+                  )}
+                  {compatSuite.running ? "Testing" : "Run"}
+                </Button>
+              </div>
+
+              {compatSuite.running ? (
+                <p aria-live="polite" className="mt-2 font-mono text-[10px] text-zinc-500">
+                  running live-site tests… results stream in as they finish (~2 min)
+                </p>
+              ) : null}
+
+              {compatSuite.results.length > 0 ? (
+                <div aria-live="polite">
+                  <p className="mt-2 font-mono text-[10px] text-zinc-500">
+                    {compatSuite.rev ?? "?"} · {""}
+                    {compatSuite.summary
+                      ? `${compatSuite.summary.pass} passed · ${compatSuite.summary.wall} site walls · ${compatSuite.summary.fail} code/network failures${
+                          compatSuite.summary.skip ? ` · ${compatSuite.summary.skip} skipped` : ""
+                        }`
+                      : `${compatSuite.results.length} finished so far`}
+                    {compatSuite.ts && !compatSuite.running
+                      ? ` · ${new Date(compatSuite.ts).toLocaleTimeString()}`
+                      : ""}
+                  </p>
+                  <ul className="mt-2 max-h-96 space-y-1 overflow-y-auto pr-1">
+                    {compatSuite.results.map((r) => (
+                      <li
+                        key={r.id}
+                        className={`rounded border px-2 py-1.5 font-mono text-[10px] ${
+                          r.status === "pass"
+                            ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-200"
+                            : r.status === "wall"
+                              ? "border-amber-400/25 bg-amber-400/5 text-amber-200"
+                              : "border-red-400/30 bg-red-400/5 text-red-200"
+                        }`}
+                        title={r.detail}
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="truncate">
+                            {r.status === "pass" ? "✓" : r.status === "wall" ? "⑂" : "✗"} {r.name}
+                          </span>
+                          <span className="shrink-0 text-zinc-500">{r.ms} ms</span>
+                        </span>
+                        <span className="mt-0.5 block break-words text-zinc-400">
+                          [{r.status === "wall" ? "upstream policy" : r.cls}] {r.detail}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mt-2 text-[10px] leading-4 text-zinc-600">
+                    Walls are the SITE&apos;s server-side policy toward relays and
+                    datacenter IPs — they lift on residential networks. A wall
+                    next to passing neighbours is PROOF the relay pipeline is
+                    healthy and the site refused.
+                  </p>
+                </div>
+              ) : null}
+
+              {!compatSuite.running && compatSuite.results.length === 0 ? (
+                <p className="mt-2 font-mono text-[10px] text-zinc-500">
+                  not run yet — press Run. A rendering watch page is not a playing
+                  video; this suite never conflates the two.
+                </p>
+              ) : null}
             </div>
           </section>
 
@@ -554,32 +706,47 @@ export default function PrivacyDrawer() {
                   <div className="grid grid-cols-3 gap-2 font-mono text-[11px]">
                     <div className="rounded border border-zinc-800/60 bg-zinc-950/40 px-2 py-2 text-center">
                       <p className="text-[9px] uppercase tracking-widest text-zinc-500">Leg A</p>
-                      <p className="mt-1 text-zinc-100">
-                        {netLegs.result.legA !== null ? `${netLegs.result.legA} ms` : "—"}
-                      </p>
+                      <p className="mt-1 text-zinc-100">{fmtMs(netLegs.result.legA?.median ?? null)}</p>
                       <p className="mt-0.5 text-[9px] text-zinc-500">you → specter</p>
                     </div>
                     <div className="rounded border border-zinc-800/60 bg-zinc-950/40 px-2 py-2 text-center">
                       <p className="text-[9px] uppercase tracking-widest text-zinc-500">Leg B</p>
-                      <p className="mt-1 text-zinc-100">
-                        {netLegs.result.legB !== null ? `${netLegs.result.legB} ms` : "—"}
-                      </p>
+                      <p className="mt-1 text-zinc-100">{fmtMs(netLegs.result.legB?.median ?? null)}</p>
                       <p className="mt-0.5 text-[9px] text-zinc-500">relay → internet</p>
                     </div>
                     <div className="rounded border border-zinc-800/60 bg-zinc-950/40 px-2 py-2 text-center">
-                      <p className="text-[9px] uppercase tracking-widest text-zinc-500">Relay ↓</p>
-                      <p className="mt-1 text-zinc-100">
-                        {netLegs.result.kbps !== null ? fmtSpeed(netLegs.result.kbps) : "—"}
-                      </p>
-                      <p className="mt-0.5 text-[9px] text-zinc-500">
-                        {netLegs.result.probeBytes > 0
-                          ? `of ${fmtBytes(netLegs.result.probeBytes)}`
-                          : "sustained"}
-                      </p>
+                      <p className="text-[9px] uppercase tracking-widest text-zinc-500">TTFB</p>
+                      <p className="mt-1 text-zinc-100">{fmtMs(netLegs.result.ttfbMs)}</p>
+                      <p className="mt-0.5 text-[9px] text-zinc-500">first byte via relay</p>
                     </div>
+                  </div>
+                  <div className="mt-2 space-y-1 font-mono text-[10px] text-zinc-400">
+                    <p>
+                      Leg A {sampleLine(netLegs.result.legA) ?? "— no successful probe"}
+                    </p>
+                    <p>
+                      Leg B {sampleLine(netLegs.result.legB) ?? "— no successful probe"}
+                    </p>
+                    <p>
+                      Download 100 KB:{" "}
+                      {netLegs.result.downSmall?.kbps != null
+                        ? `${fmtSpeed(netLegs.result.downSmall.kbps)} (${fmtBytes(netLegs.result.downSmall.bytes)})`
+                        : `failed — ${netLegs.result.downSmall?.error ?? "unknown"}`}
+                    </p>
+                    <p>
+                      Download 1 MB:{" "}
+                      {netLegs.result.downLarge?.kbps != null
+                        ? `${fmtSpeed(netLegs.result.downLarge.kbps)} (${fmtBytes(netLegs.result.downLarge.bytes)})`
+                        : `failed — ${netLegs.result.downLarge?.error ?? "unknown"}`}
+                    </p>
                   </div>
                   <p className={`mt-2 text-[10px] leading-4 ${legVerdict(netLegs.result).tone}`}>
                     {legVerdict(netLegs.result).text}
+                  </p>
+                  <p className="mt-1 text-[10px] leading-4 text-zinc-600">
+                    Medians of 6 probes each — one slow response never proves a
+                    bottleneck. A big TTFB-vs-total gap means slow relay start;
+                    matching numbers mean steady transfer.
                   </p>
                 </div>
               ) : null}
@@ -609,8 +776,10 @@ export default function PrivacyDrawer() {
                   ["works", "Hacker News", "rows, links, navigation"],
                   ["works", "BBC News", "full-quality images, lazy feed"],
                   ["works", "video pipeline", "Range streaming, seek, no amplification"],
+                  ["works", "repeat visits", "public images/fonts/css/js served from the RAM cache"],
                   ["works", "search + downloads", "encrypted search, built-in downloader"],
                   ["mixed", "YouTube", "browse/search/watch pages OK · playback walled by YouTube's anti-bot policy on datacenter IPs"],
+                  ["upstream", "YouTube sign-in", "Google refuses sign-ins from relayed browsers ('may not be secure') — honest notice shown in-page"],
                   ["mixed", "DuckDuckGo", "serves bot-walls to datacenter IPs"],
                   ["upstream", "X / Twitter", "X's own anti-bot JS refuses any proxy"],
                   ["upstream", "Reddit", "network-level 403 for datacenter IPs"],
