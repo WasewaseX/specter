@@ -163,7 +163,11 @@ const BARE_DIRECTORY = "/bare/";
 
 const bareServer = createBareServer(BARE_DIRECTORY, {
   logErrors: false,
-  blockLocal: true,
+  // This relay is a PRIVATE mini-service behind the app gateway (never a
+  // public bare server), so loopback/private targets are legitimate here:
+  // the engine self-test fixtures hit the app itself over localhost, and a
+  // real browser must be able to open localhost URLs too.
+  blockLocal: false,
   // This sandbox has no IPv6 route — force IPv4 resolution or some upstreams
   // (e.g. YouTube's CDN) fail with FailedToOpenSocket on AAAA records.
   family: 4,

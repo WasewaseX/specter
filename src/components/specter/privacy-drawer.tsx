@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { Flame, ShieldCheck, X, Zap } from "lucide-react";
+import { Activity, Flame, Loader2, ShieldCheck, ShieldOff, X, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -77,6 +77,15 @@ export default function PrivacyDrawer() {
   const adBlock = useSpecter((s) => s.adBlock);
   const setAdBlock = useSpecter((s) => s.setAdBlock);
   const stats = useSpecter((s) => s.stats);
+  const lastBlocked = useSpecter((s) => s.lastBlocked);
+  const tabs = useSpecter((s) => s.tabs);
+  const activeTabId = useSpecter((s) => s.activeTabId);
+  const bypassHosts = useSpecter((s) => s.bypassHosts);
+  const bypassFirewallFor = useSpecter((s) => s.bypassFirewallFor);
+  const restoreFirewallFor = useSpecter((s) => s.restoreFirewallFor);
+  const uvStatus = useSpecter((s) => s.uvStatus);
+  const selfTest = useSpecter((s) => s.selfTest);
+  const runSelfTest = useSpecter((s) => s.runSelfTest);
   const panicWipe = useSpecter((s) => s.panicWipe);
   const { toast } = useToast();
 
@@ -103,6 +112,33 @@ export default function PrivacyDrawer() {
       description: "Session destroyed, vault erased, memory cleared.",
     });
   };
+
+  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const webHost =
+    activeTab?.kind === "web" && activeTab.url
+      ? (() => {
+          try {
+            return new URL(activeTab.url).host;
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+  const siteBypassed = webHost ? bypassHosts.includes(webHost) : false;
+
+  const handleRunSelfTest = () => {
+    if (uvStatus !== "ready") {
+      toast({
+        title: "Engine offline",
+        description: "The browser engine must be running to test its pipeline.",
+      });
+      return;
+    }
+    runSelfTest();
+  };
+
+  const fmtBytes = (b: number) =>
+    b < 1024 ? `${b} B` : b < 1024 * 1024 ? `${(b / 1024).toFixed(1)} KB` : `${(b / (1024 * 1024)).toFixed(1)} MB`;
 
   return (
     <div className="fixed inset-0 z-50">
@@ -248,6 +284,50 @@ export default function PrivacyDrawer() {
                   <p className="text-[11px] text-zinc-500">
                     Engine-level blocking — pages never load tracking junk
                   </p>
+                  {lastBlocked ? (
+                    <p
+                      className="mt-1 truncate font-mono text-[10px] text-zinc-600"
+                      title={`${lastBlocked.host} — matched rule ${lastBlocked.rule}`}
+                    >
+                      last: {lastBlocked.rule} ({lastBlocked.host})
+                    </p>
+                  ) : null}
+                  {webHost ? (
+                    <div className="mt-2">
+                      {siteBypassed ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 font-mono text-[10px] uppercase tracking-widest text-amber-300 hover:bg-amber-400/10 hover:text-amber-200"
+                          onClick={() => {
+                            restoreFirewallFor(webHost);
+                            toast({ title: `Firewall restored on ${webHost}` });
+                          }}
+                          aria-label={`Restore tracker firewall on ${webHost}`}
+                        >
+                          <ShieldCheck className="mr-1 h-3 w-3" aria-hidden="true" />
+                          restore on {webHost}
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 font-mono text-[10px] uppercase tracking-widest text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-300"
+                          onClick={() => {
+                            bypassFirewallFor(webHost);
+                            toast({
+                              title: `Firewall bypassed on ${webHost}`,
+                              description: "This session only — reload clears it.",
+                            });
+                          }}
+                          aria-label={`Bypass tracker firewall on ${webHost} for this session`}
+                        >
+                          <ShieldOff className="mr-1 h-3 w-3" aria-hidden="true" />
+                          bypass on {webHost}
+                        </Button>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
                 <Switch
                   checked={adBlock}
@@ -310,16 +390,80 @@ export default function PrivacyDrawer() {
               <DefRow label="Bandwidth saved (Data Saver)">
                 <span className="inline-flex items-center gap-1.5 text-emerald-300">
                   <Zap className="size-3" aria-hidden="true" />
-                  {stats.bytesSaved < 1024
-                    ? `${stats.bytesSaved} B`
-                    : stats.bytesSaved < 1024 * 1024
-                      ? `${(stats.bytesSaved / 1024).toFixed(1)} KB`
-                      : `${(stats.bytesSaved / (1024 * 1024)).toFixed(1)} MB`}
+                  {fmtBytes(stats.bytesSaved)}
                 </span>
               </DefRow>
               <DefRow label="Videos deferred (Data Saver)">
                 <span className="text-zinc-300">{stats.videosDeferred}</span>
               </DefRow>
+            </div>
+          </section>
+
+          {/* ── engine diagnostics ─────────────────────── */}
+          <section>
+            <SectionHeading>ENGINE DIAGNOSTICS</SectionHeading>
+            <div className="mt-2 rounded-lg border border-zinc-800/60 bg-zinc-900/40 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] leading-5 text-zinc-400">
+                  Exercises the full network pipeline through the engine relay:
+                  POST bodies, redirects, cookies, images, Range streaming,
+                  download headers, HTML rewriting and blocker precision.
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleRunSelfTest}
+                  disabled={selfTest.running}
+                  aria-label="Run network pipeline diagnostics"
+                  className="shrink-0 bg-emerald-400 font-mono text-[10px] uppercase tracking-widest text-zinc-950 hover:bg-emerald-300"
+                >
+                  {selfTest.running ? (
+                    <Loader2 className="mr-1 h-3 w-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Activity className="mr-1 h-3 w-3" aria-hidden="true" />
+                  )}
+                  Run
+                </Button>
+              </div>
+
+              {selfTest.running ? (
+                <p aria-live="polite" className="mt-2 font-mono text-[10px] text-zinc-500">
+                  running pipeline tests…
+                </p>
+              ) : null}
+
+              {!selfTest.running && selfTest.results ? (
+                <div aria-live="polite">
+                  <p className="mt-2 font-mono text-[10px] text-zinc-500">
+                    engine {selfTest.rev ?? "?"} · {" "}
+                    {selfTest.results.filter((r) => r.pass).length}/{selfTest.results.length} passed
+                    {selfTest.ts ? ` · ${new Date(selfTest.ts).toLocaleTimeString()}` : ""}
+                  </p>
+                  <ul className="mt-2 max-h-96 space-y-1 overflow-y-auto pr-1">
+                    {selfTest.results.map((r) => (
+                      <li
+                        key={r.name}
+                        className={`rounded border px-2 py-1.5 font-mono text-[10px] ${
+                          r.pass
+                            ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-200"
+                            : "border-red-400/30 bg-red-400/5 text-red-200"
+                        }`}
+                        title={r.detail}
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="truncate">
+                            {r.pass ? "✓" : "✗"} {r.name}
+                          </span>
+                          <span className="shrink-0 text-zinc-500">{r.ms} ms</span>
+                        </span>
+                        {!r.pass ? (
+                          <span className="mt-0.5 block break-words text-zinc-400">{r.detail}</span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
           </section>
 

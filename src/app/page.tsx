@@ -22,29 +22,39 @@ export default function Home() {
   const tabs = useSpecter((s) => s.tabs);
   const activeTabId = useSpecter((s) => s.activeTabId);
   const handlePageMessage = useSpecter((s) => s.handlePageMessage);
-  const addStats = useSpecter((s) => s.addStats);
+  const recordBlocked = useSpecter((s) => s.recordBlocked);
+  const setSelfTest = useSpecter((s) => s.setSelfTest);
 
   useEffect(() => {
     void boot();
   }, [boot]);
 
-  // messages from the engine SW: blocked trackers + compression stats
+  // messages from the engine SW: blocked trackers + diagnostics results
   useEffect(() => {
     const unsubscribe = subscribeUvMessages((data) => {
       if (data.type === "specter:blocked") {
-        addStats({ blocked: 1 });
+        recordBlocked(
+          typeof data.rule === "string" ? data.rule : undefined,
+          typeof data.url === "string" ? data.url : ""
+        );
       } else if (data.type === "specter:img") {
         const saved = Number(data.saved) || 0;
-        addStats({ imagesCompressed: 1, bytesSaved: saved });
+        useSpecter.getState().addStats({ imagesCompressed: 1, bytesSaved: saved });
       } else if (data.type === "specter:media") {
         // bytes the video element actually pulled over the wire (Range
         // streaming = only what was watched; browser cache serves replays)
         const bytes = Number(data.bytes) || 0;
-        if (bytes > 0) addStats({ mediaBytes: bytes });
+        if (bytes > 0) useSpecter.getState().addStats({ mediaBytes: bytes });
+      } else if (data.type === "specter:selftest" && Array.isArray(data.results)) {
+        setSelfTest({
+          results: data.results as { name: string; pass: boolean; detail: string; ms: number }[],
+          rev: typeof data.rev === "string" ? data.rev : null,
+          ts: Number(data.ts) || Date.now(),
+        });
       }
     });
     return unsubscribe;
-  }, [addStats]);
+  }, [recordBlocked, setSelfTest]);
 
   // messages from injected page hooks: address-bar sync + popup → tab
   useEffect(() => {

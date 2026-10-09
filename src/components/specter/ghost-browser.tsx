@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, BookOpen, Ghost, Globe, Loader2, X } from "lucide-react";
+import { AlertTriangle, BookOpen, Ghost, Globe, Loader2, RefreshCw, ShieldAlert, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -17,13 +17,20 @@ const UV_SANDBOX =
 /**
  * GhostBrowser — the surface of the active tab.
  * newtab → start page · search → encrypted results · web → the full
- * Ultraviolet browser (or the hardened relay fallback), with Min-style
- * Reader Mode on demand.
+ * Ultraviolet browser, with Min-style Reader Mode on demand.
+ *
+ * Engine failures are NEVER silent: while the engine boots the tab shows an
+ * honest "starting engine" state; if the engine failed, the tab shows an
+ * explicit offline screen with a Retry control, and the script-stripped
+ * limited viewer is only ever used after the user consciously opts in —
+ * never smuggled in as if it were the full browser.
  */
 export default function GhostBrowser() {
   const tabs = useSpecter((s) => s.tabs);
   const activeTabId = useSpecter((s) => s.activeTabId);
-  const uvAvailable = useSpecter((s) => s.uvAvailable);
+  const uvStatus = useSpecter((s) => s.uvStatus);
+  const uvAvailable = uvStatus === "ready";
+  const relayFallbackAck = useSpecter((s) => s.relayFallbackAck);
   const readerOn = useSpecter((s) => s.readerOn);
   const key = useSpecter((s) => s.key);
   const sid = useSpecter((s) => s.sid);
@@ -40,9 +47,10 @@ export default function GhostBrowser() {
     setFallbackState({ url: webUrl, src: null });
   }
 
-  // hardened fallback src (encrypted relay, scripts stripped) — UV-less only
+  // hardened fallback src (encrypted relay, scripts stripped) — only built
+  // once the user has explicitly chosen the limited viewer
   useEffect(() => {
-    if (!webUrl || uvAvailable || !key || !sid) return;
+    if (!webUrl || uvAvailable || !relayFallbackAck || !key || !sid) return;
     let cancelled = false;
     void buildProxySrc(key, sid, webUrl, false, false).then((src) => {
       if (!cancelled) setFallbackState({ url: webUrl, src });
@@ -50,7 +58,7 @@ export default function GhostBrowser() {
     return () => {
       cancelled = true;
     };
-  }, [webUrl, uvAvailable, key, sid]);
+  }, [webUrl, uvAvailable, relayFallbackAck, key, sid]);
 
   const fallbackSrc = fallbackState.url === webUrl ? fallbackState.src : null;
 
@@ -72,6 +80,23 @@ export default function GhostBrowser() {
     return <ReaderView url={active.url} />;
   }
 
+  // engine still negotiating — honest loading state, never a silent fallback
+  if (uvStatus === "booting" && webUrl) {
+    return (
+      <div className="flex h-full items-center justify-center" aria-busy="true">
+        <div className="flex flex-col items-center gap-3 text-zinc-500">
+          <Loader2 className="h-6 w-6 animate-spin text-emerald-400" aria-hidden="true" />
+          <p className="font-mono text-[11px] uppercase tracking-widest">Starting browser engine…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // engine failed and the user has not opted into the limited viewer
+  if (uvStatus === "failed" && !relayFallbackAck) {
+    return <EngineOffline />;
+  }
+
   const src = webUrl ? (uvAvailable ? uvHref(webUrl) : fallbackSrc) : null;
 
   return (
@@ -81,6 +106,29 @@ export default function GhostBrowser() {
           className="absolute left-0 top-0 z-10 h-0.5 w-full animate-pulse bg-emerald-400"
           aria-hidden="true"
         />
+      ) : null}
+
+      {/* explicit, honest banner — the limited viewer is NOT the full browser */}
+      {!uvAvailable && relayFallbackAck ? (
+        <div
+          role="status"
+          className="flex flex-none items-center gap-2 border-b border-amber-400/25 bg-amber-400/10 px-3 py-1.5"
+        >
+          <ShieldAlert className="h-3.5 w-3.5 flex-none text-amber-300" aria-hidden="true" />
+          <p className="truncate font-mono text-[10px] uppercase tracking-widest text-amber-200">
+            Limited viewer — scripts stripped (engine offline)
+          </p>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void useSpecter.getState().retryEngine()}
+            className="ml-auto h-7 flex-none px-2 font-mono text-[10px] uppercase tracking-widest text-amber-200 hover:bg-amber-400/10 hover:text-amber-100"
+            aria-label="Retry the browser engine"
+          >
+            <RefreshCw className="mr-1 h-3 w-3" aria-hidden="true" />
+            Retry engine
+          </Button>
+        </div>
       ) : null}
 
       {src ? (
@@ -101,6 +149,64 @@ export default function GhostBrowser() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ── engine failure screen (never silently looks like a loaded page) ── */
+
+function EngineOffline() {
+  const uvError = useSpecter((s) => s.uvError);
+  const retryEngine = useSpecter((s) => s.retryEngine);
+  const ackRelayFallback = useSpecter((s) => s.ackRelayFallback);
+  const uvStatus = useSpecter((s) => s.uvStatus);
+  const retrying = uvStatus === "booting";
+
+  return (
+    <div className="flex h-full items-center justify-center overflow-y-auto px-4 py-10">
+      <div className="w-full max-w-md rounded-xl border border-red-400/20 bg-red-400/5 p-6 text-center">
+        <AlertTriangle className="mx-auto h-8 w-8 text-red-400" aria-hidden="true" />
+        <h2 className="mt-4 font-mono text-xs uppercase tracking-[0.25em] text-red-300">
+          Browser engine offline
+        </h2>
+        <p className="mt-3 break-words font-mono text-[11px] text-zinc-500" role="alert">
+          {uvError ?? "unknown engine failure"}
+        </p>
+        <p className="mt-4 text-sm leading-6 text-zinc-400">
+          Modern sites need the full engine (scripts, XHR, streaming). The alternative
+          is a limited viewer with scripts stripped — plain pages render, apps will
+          look broken. Nothing about this failure was logged.
+        </p>
+        <div className="mt-6 flex flex-col gap-2">
+          <Button
+            type="button"
+            onClick={() => void retryEngine()}
+            disabled={retrying}
+            aria-label="Retry browser engine startup"
+            className="bg-emerald-400 text-zinc-950 hover:bg-emerald-300"
+          >
+            {retrying ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <RefreshCw className="mr-2 h-4 w-4" aria-hidden="true" />
+            )}
+            Retry browser engine
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={ackRelayFallback}
+            className="text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200"
+            aria-label="Continue in the limited script-stripped viewer"
+          >
+            <ShieldAlert className="mr-2 h-4 w-4" aria-hidden="true" />
+            Continue in limited viewer
+          </Button>
+        </div>
+        <p className="mt-4 font-mono text-[10px] uppercase tracking-widest text-zinc-600">
+          relay usually recovers in seconds — retry fixes most failures
+        </p>
+      </div>
     </div>
   );
 }

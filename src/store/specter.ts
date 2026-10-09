@@ -15,10 +15,12 @@ import { exportKey, generateSessionKey } from "@/lib/crypto";
 import { buildProxySrc, securePost, unsealProxyLocation } from "@/lib/secure-client";
 import {
   ensureUvEngine,
+  retryUvEngine,
   uvEngineLoaded,
   uvHref,
   uvRealUrl,
   pushUvSettings,
+  postUvMessage,
 } from "@/lib/uv-browser";
 import {
   vaultCreate,
@@ -63,6 +65,17 @@ export interface MediaItem {
   k: string;
 }
 
+/** One line of the engine's network-pipeline diagnostics (RAM only). */
+export interface SelfTestResult {
+  name: string;
+  pass: boolean;
+  detail: string;
+  ms: number;
+}
+
+/** Lifecycle of the Ghost Browser engine (never silently ambiguous). */
+export type UvStatus = "booting" | "ready" | "failed";
+
 export interface BrowserStats {
   blocked: number;
   imagesCompressed: number;
@@ -97,6 +110,23 @@ interface SpecterState {
   tabs: BrowserTab[];
   activeTabId: string | null;
   uvAvailable: boolean;
+  /** full engine lifecycle — UI must never guess between booting/broken */
+  uvStatus: UvStatus;
+  /** readable, stage-tagged boot error (null when ready) */
+  uvError: string | null;
+  /** user explicitly chose the limited relay viewer after engine failure */
+  relayFallbackAck: boolean;
+  /** sites where the tracker firewall is suspended this session (RAM only) */
+  bypassHosts: string[];
+  /** last tracker blocked, with the precise rule that caught it */
+  lastBlocked: { host: string; rule: string; ts: number } | null;
+  /** network-pipeline diagnostics run by the engine SW */
+  selfTest: {
+    running: boolean;
+    results: SelfTestResult[] | null;
+    rev: string | null;
+    ts: number | null;
+  };
   dataSaver: boolean;
   adBlock: boolean;
   readerOn: boolean;
@@ -140,6 +170,21 @@ interface SpecterState {
   setAdBlock: (v: boolean) => void;
   addStats: (delta: Partial<BrowserStats>) => void;
   setDrawerOpen: (v: boolean) => void;
+
+  /** Attempt a fresh engine boot after a failure (P0 recovery control). */
+  retryEngine: () => Promise<void>;
+  /** User explicitly accepts the script-stripped limited viewer. */
+  ackRelayFallback: () => void;
+  /** Suspend the tracker firewall for one site (this session only). */
+  bypassFirewallFor: (host: string) => void;
+  /** Re-enable the tracker firewall for a site. */
+  restoreFirewallFor: (host: string) => void;
+  /** Record a blocked tracker with the rule that caught it (from SW). */
+  recordBlocked: (rule: string | undefined, url: string) => void;
+  /** Receive diagnostics results from the engine SW. */
+  setSelfTest: (r: { results: SelfTestResult[]; rev: string | null; ts: number }) => void;
+  /** Run the engine's network-pipeline diagnostics. */
+  runSelfTest: () => void;
 
   createVault: (pass: string, confirm: string) => Promise<string | null>;
   unlockVault: (pass: string) => Promise<string | null>;
@@ -242,6 +287,12 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   tabs: [INITIAL_TAB],
   activeTabId: INITIAL_TAB.id,
   uvAvailable: false,
+  uvStatus: "booting",
+  uvError: null,
+  relayFallbackAck: false,
+  bypassHosts: [],
+  lastBlocked: null,
+  selfTest: { running: false, results: null, rev: null, ts: null },
   /* Data Saver is strictly optional — OFF by default so every site renders at
    * full quality. Bandwidth efficiency never depended on it anyway: media is
    * Range-streamed (only watched seconds download) and trackers are blocked
@@ -278,12 +329,90 @@ export const useSpecter = create<SpecterState>((set, get) => ({
     }
 
     // Boot the full browser engine (Ultraviolet SW + bare relay).
-    const uvReady = await ensureUvEngine();
-    set({ uvAvailable: uvReady });
-    if (uvReady) {
-      const { dataSaver, adBlock } = get();
-      void pushUvSettings({ dataSaver, adBlock });
+    const uv = await ensureUvEngine();
+    if (uv.ok) {
+      set({ uvStatus: "ready", uvAvailable: true, uvError: null, relayFallbackAck: false });
+      const { dataSaver, adBlock, bypassHosts } = get();
+      void pushUvSettings({ dataSaver, adBlock, bypassHosts });
+    } else {
+      set({ uvStatus: "failed", uvAvailable: false, uvError: uv.error });
     }
+  },
+
+  retryEngine: async () => {
+    if (get().uvStatus === "booting") return;
+    set({ uvStatus: "booting", uvError: null });
+    const uv = await retryUvEngine();
+    if (uv.ok) {
+      set({ uvStatus: "ready", uvAvailable: true, uvError: null, relayFallbackAck: false });
+      const { dataSaver, adBlock, bypassHosts } = get();
+      void pushUvSettings({ dataSaver, adBlock, bypassHosts });
+    } else {
+      set({ uvStatus: "failed", uvAvailable: false, uvError: uv.error });
+    }
+  },
+
+  ackRelayFallback: () => set({ relayFallbackAck: true }),
+
+  bypassFirewallFor: (host) => {
+    const clean = host.trim().toLowerCase();
+    if (!clean) return;
+    const { bypassHosts, dataSaver, adBlock } = get();
+    if (bypassHosts.includes(clean)) return;
+    const next = [...bypassHosts, clean].slice(0, 20);
+    set({ bypassHosts: next });
+    void pushUvSettings({ dataSaver, adBlock, bypassHosts: next });
+  },
+
+  restoreFirewallFor: (host) => {
+    const clean = host.trim().toLowerCase();
+    const { bypassHosts, dataSaver, adBlock } = get();
+    const next = bypassHosts.filter((h) => h !== clean);
+    set({ bypassHosts: next });
+    void pushUvSettings({ dataSaver, adBlock, bypassHosts: next });
+  },
+
+  recordBlocked: (rule, url) => {
+    get().addStats({ blocked: 1 });
+    if (!rule) return;
+    let host = url;
+    try {
+      host = new URL(url).host;
+    } catch {
+      /* keep raw */
+    }
+    set({ lastBlocked: { host, rule, ts: Date.now() } });
+  },
+
+  setSelfTest: ({ results, rev, ts }) => {
+    set({ selfTest: { running: false, results, rev, ts } });
+  },
+
+  runSelfTest: () => {
+    if (get().selfTest.running) return;
+    set({ selfTest: { running: true, results: null, rev: null, ts: null } });
+    void postUvMessage({ type: "specter:selftest" });
+    // safety net: if the engine never answers (dead SW), stop "running"
+    setTimeout(() => {
+      const st = get().selfTest;
+      if (st.running && !st.results) {
+        set({
+          selfTest: {
+            running: false,
+            results: [
+              {
+                name: "engine_contact",
+                pass: false,
+                detail: "engine SW did not answer — retry the browser engine",
+                ms: 0,
+              },
+            ],
+            rev: null,
+            ts: Date.now(),
+          },
+        });
+      }
+    }, 15000);
   },
 
   setQuery: (q) => set({ query: q }),
@@ -662,8 +791,8 @@ export const useSpecter = create<SpecterState>((set, get) => ({
 
   setDataSaver: (v) => {
     set({ dataSaver: v });
-    const { adBlock, uvAvailable } = get();
-    void pushUvSettings({ dataSaver: v, adBlock });
+    const { adBlock, bypassHosts } = get();
+    void pushUvSettings({ dataSaver: v, adBlock, bypassHosts });
     if (typeof window !== "undefined") {
       try {
         window.localStorage.setItem("specter:settings", JSON.stringify({ dataSaver: v, adBlock }));
@@ -671,13 +800,12 @@ export const useSpecter = create<SpecterState>((set, get) => ({
         /* ignore */
       }
     }
-    void uvAvailable;
   },
 
   setAdBlock: (v) => {
     set({ adBlock: v });
-    const { dataSaver } = get();
-    void pushUvSettings({ dataSaver, adBlock: v });
+    const { dataSaver, bypassHosts } = get();
+    void pushUvSettings({ dataSaver, adBlock: v, bypassHosts });
     if (typeof window !== "undefined") {
       try {
         window.localStorage.setItem("specter:settings", JSON.stringify({ dataSaver, adBlock: v }));

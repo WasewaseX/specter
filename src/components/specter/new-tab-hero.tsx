@@ -8,7 +8,6 @@ import {
   Github,
   Globe,
   Lock,
-  MonitorPlay,
   Newspaper,
   Search,
   ShieldCheck,
@@ -41,8 +40,10 @@ export default function NewTabHero() {
   const recencyDays = useSpecter((s) => s.recencyDays);
   const setRecencyDays = useSpecter((s) => s.setRecencyDays);
   const sessionReady = useSpecter((s) => s.sessionReady);
-  const uvAvailable = useSpecter((s) => s.uvAvailable);
+  const uvStatus = useSpecter((s) => s.uvStatus);
+  const uvAvailable = uvStatus === "ready";
   const booting = useSpecter((s) => s.booting);
+  const retryEngine = useSpecter((s) => s.retryEngine);
 
   function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -54,7 +55,6 @@ export default function NewTabHero() {
     { label: "Wikipedia", url: "https://en.wikipedia.org/wiki/Main_Page", icon: Newspaper },
     { label: "YouTube", url: "https://www.youtube.com", icon: Youtube },
     { label: "BBC News", url: "https://www.bbc.com/news", icon: Globe },
-    { label: "Iwara", url: "https://www.iwara.tv", icon: MonitorPlay },
     { label: "Hacker News", url: "https://news.ycombinator.com", icon: Globe },
     { label: "GitHub", url: "https://github.com", icon: Github },
     { label: "Wikivoyage", url: "https://en.wikivoyage.org/wiki/Main_Page", icon: Newspaper },
@@ -206,12 +206,26 @@ export default function NewTabHero() {
       <p aria-live="polite" className="mt-5 font-mono text-[10px] text-zinc-600">
         {booting
           ? "negotiating encrypted channel…"
-          : sessionReady
-            ? uvAvailable
-              ? "channel established · browser engine online"
-              : "channel established · hardened relay online"
-            : "channel offline — retry by reopening"}
+          : !sessionReady
+            ? "channel offline — retry by reopening"
+            : uvStatus === "booting"
+              ? "channel established · starting browser engine…"
+              : uvStatus === "ready"
+                ? "channel established · browser engine online"
+                : "channel established · BROWSER ENGINE OFFLINE"}
       </p>
+
+      {sessionReady && uvStatus === "failed" ? (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => void retryEngine()}
+          aria-label="Retry browser engine startup"
+          className="mt-3 border-red-400/40 bg-transparent font-mono text-[10px] uppercase tracking-widest text-red-300 hover:bg-red-400/10 hover:text-red-200"
+        >
+          Retry browser engine
+        </Button>
+      ) : null}
     </div>
   );
 }

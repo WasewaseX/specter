@@ -34,27 +34,28 @@ importScripts(__uv$config.sw || "/uv/uv.sw.js");
  * Bandwidth efficiency is independent — media Range-streams through
  * /api/stream (only watched seconds download) and trackers are blocked
  * below, so a 100 MB video still costs ≈100 MB, never 160 MB. */
-const SETTINGS = { dataSaver: false, adBlock: true };
+const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-11-split-meta";
+const ENGINE_REV = "rev-12b-precise-block";
 
-/* ── tracker / ad firewall (substring match on href) ────────── */
-const BLOCKED_HOSTS = [
+/* ── tracker / ad firewall (parsed-hostname matching) ──────────
+ * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
+ * blind substring of the whole URL. The old substring test broke ordinary
+ * pages whose path/query merely CONTAINED a rule fragment (e.g. an article
+ * at /docs/branch.io or ?redirect=criteo.com). A small PATH_RULES set covers
+ * trackers that live on well-known paths of otherwise-legit hosts. */
+const BLOCK_HOSTS = [
   "doubleclick.net",
   "googlesyndication.com",
   "google-analytics.com",
   "googletagmanager.com",
   "googletagservices.com",
-  "adservice.google.",
-  "pagead2.google.",
   "partner.googleadservices.com",
   "connect.facebook.net",
-  "www.facebook.com/tr",
   "analytics.facebook.com",
   "ads-twitter.com",
-  "static.ads-twitter.com",
   "analytics.tiktok.com",
   "ads.linkedin.com",
   "bat.bing.com",
@@ -62,14 +63,12 @@ const BLOCKED_HOSTS = [
   "scorecardresearch.com",
   "quantserve.com",
   "quantcast.mgr.consensu.org",
-  "criteo.",
   "taboola.com",
   "outbrain.com",
   "hotjar.com",
   "hotjar.io",
   "mixpanel.com",
   "segment.io",
-  "segment.com/analytics.js",
   "amplitude.com",
   "optimizely.com",
   "moatads.com",
@@ -94,8 +93,7 @@ const BLOCKED_HOSTS = [
   "sharethis.com",
   "ct.pinterest.com",
   "tr.snapchat.com",
-  "cdn.onesignal.com",
-  "onesignal.com/sdks",
+  "onesignal.com",
   "pushwoosh.com",
   "branch.io",
   "appsflyer.com",
@@ -116,19 +114,69 @@ const BLOCKED_HOSTS = [
   "everesttech.net",
   "agkn.com",
   "rlcdn.com",
-  "match.adsrvr.org",
 ];
+/* hostname-prefix rules (trailing dot in the rule = match from the start,
+ * e.g. adservice.google.{com,co.uk,…}) — safe because the host is parsed */
+const BLOCK_PREFIX = ["adservice.google.", "pagead2.google.", "criteo."];
+/* tracker paths on legit hosts — parsed pathname must start with these */
+const BLOCK_PATHS = [
+  { host: "facebook.com", path: "/tr" },
+  { host: "segment.com", path: "/analytics.js" },
+  { host: "onesignal.com", path: "/sdks" },
+];
+
+/** Returns the matching rule label, or null when the request is allowed. */
+function matchBlockRule(url) {
+  const host = url.hostname.toLowerCase();
+  for (const rule of BLOCK_HOSTS) {
+    if (host === rule || host.endsWith("." + rule)) return rule;
+  }
+  for (const rule of BLOCK_PREFIX) {
+    if (host.startsWith(rule)) return rule + "*";
+  }
+  for (const rule of BLOCK_PATHS) {
+    if (
+      (host === rule.host || host.endsWith("." + rule.host)) &&
+      url.pathname.toLowerCase().startsWith(rule.path)
+    ) {
+      return rule.host + rule.path;
+    }
+  }
+  return null;
+}
+
+/** Host of the proxied page that fired this request (decoded referrer). */
+function referrerPageHost(event) {
+  try {
+    const ref = event.request && event.request.referrer;
+    if (!ref || !ref.startsWith(location.origin)) return null;
+    const ru = new URL(ref);
+    const prefix = (__uv$config && __uv$config.prefix) || "/service/";
+    if (!ru.pathname.startsWith(prefix)) return null;
+    const real = decodeURIComponent(ru.pathname.slice(prefix.length) + ru.search);
+    if (!/^https?:\/\//i.test(real)) return null;
+    return new URL(real).hostname.toLowerCase();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Temporary per-site bypass — the app can suspend the firewall for a site
+ *  whose legitimate resources were caught. Hosts arrive via settings. */
+function bypassedFor(event, realUrl) {
+  const list = SETTINGS.bypassHosts;
+  if (!list || !list.length) return false;
+  const pageHost = referrerPageHost(event);
+  if (pageHost && list.includes(pageHost)) return true;
+  if (realUrl && list.includes(realUrl.hostname.toLowerCase())) return true;
+  return false;
+}
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|bmp|tiff?|gif|svg)(\?|#|$)/i;
 const PIXEL_GIF = new Uint8Array([
   71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 33, 249, 4,
   1, 0, 0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59,
 ]);
-
-function hostBlocked(url) {
-  const href = url.href;
-  return BLOCKED_HOSTS.some((frag) => href.includes(frag));
-}
 
 function isImageRequest(dest, realPath) {
   if (dest === "image") return true;
@@ -604,8 +652,10 @@ async function handleRequest(event) {
     if (requestUrl.origin !== location.origin && /^https?:$/.test(requestUrl.protocol)) {
       const realAbs = requestUrl.href;
       try {
-        if (SETTINGS.adBlock && hostBlocked(realAbs)) {
-          reportToClients({ type: "specter:blocked", url: realAbs });
+        const blockRule =
+          SETTINGS.adBlock && !bypassedFor(event, null) ? matchBlockRule(requestUrl) : null;
+        if (blockRule) {
+          reportToClients({ type: "specter:blocked", url: realAbs, rule: blockRule });
           return new Response(null, { status: 204 });
         }
         if (event.request.destination === "document") {
@@ -668,8 +718,10 @@ async function handleRequest(event) {
   }
 
   /* 2) tracker / ad firewall — blocked before anything else */
-  if (SETTINGS.adBlock && hostBlocked(realUrl)) {
-    reportToClients({ type: "specter:blocked", url: real });
+  const blockRule =
+    SETTINGS.adBlock && !bypassedFor(event, realUrl) ? matchBlockRule(realUrl) : null;
+  if (blockRule) {
+    reportToClients({ type: "specter:blocked", url: real, rule: blockRule });
     if (isImageRequest(dest, realUrl.pathname)) {
       return new Response(PIXEL_GIF.buffer, {
         status: 200,
@@ -764,8 +816,223 @@ self.addEventListener("message", (event) => {
   if (d.type === "specter:settings") {
     if (typeof d.dataSaver === "boolean") SETTINGS.dataSaver = d.dataSaver;
     if (typeof d.adBlock === "boolean") SETTINGS.adBlock = d.adBlock;
+    if (Array.isArray(d.bypassHosts)) {
+      SETTINGS.bypassHosts = d.bypassHosts
+        .filter((h) => typeof h === "string" && h.length < 200)
+        .slice(0, 20);
+    }
+  }
+  if (d.type === "specter:selftest") {
+    void runSelfTest();
   }
 });
+
+/* ── network pipeline self-test (repeatability suite) ─────────
+ * Runs the full stack the way real traffic flows — the same handleRequest /
+ * directBareFetch / relay path — against local echo endpoints, and asserts:
+ * POST bodies, redirects, the RAM cookie jar, image routing, Range/206
+ * streaming, download headers, HTML rewriting and precise blocker rules.
+ * Results stream back to the app as a `specter:selftest` message. */
+async function selfTestSvc(realUrl, init) {
+  const enc = __uv$config.encodeUrl(realUrl);
+  const url = location.origin + (__uv$config.prefix || "/service/") + enc;
+  const request = new Request(url, init || undefined);
+  const event = { request, clientId: "", waitUntil() {}, respondWith() {} };
+  return handleRequest(event);
+}
+
+async function selfTestStep(name, fn) {
+  const t0 = Date.now();
+  try {
+    const detail = await fn();
+    return { name, pass: true, detail: String(detail || "ok").slice(0, 220), ms: Date.now() - t0 };
+  } catch (e) {
+    return {
+      name,
+      pass: false,
+      detail: String((e && (e.message || e)) || "failed").slice(0, 220),
+      ms: Date.now() - t0,
+    };
+  }
+}
+
+async function expectJson(resp, check) {
+  const j = await resp.json();
+  check(j);
+  return j;
+}
+
+async function runSelfTest() {
+  const ORIGIN_UPSTREAM = "http://localhost:3000"; // the relay reaches the app directly
+  const results = [];
+
+  results.push(
+    await selfTestStep("relay_heartbeat", async () => {
+      const r = await fetch("/bare/?XTransformPort=3030&selftest=" + Date.now(), {
+        cache: "no-store",
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return "HTTP " + r.status;
+    })
+  );
+
+  results.push(
+    await selfTestStep("post_roundtrip", async () => {
+      // regression test: bare-mux used to DROP request bodies (killed YouTube)
+      const payload = JSON.stringify({
+        ping: "specter-" + Date.now(),
+        blob: "x".repeat(4096),
+      });
+      const resp = await selfTestSvc(ORIGIN_UPSTREAM + "/api/net-test/echo", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: payload,
+      });
+      if (resp.status !== 200) throw new Error("status " + resp.status);
+      return expectJson(resp, (j) => {
+        if (j.method !== "POST") throw new Error("method " + j.method);
+        if (j.body !== payload) throw new Error("body mismatch (" + String(j.body || "").length + "b)");
+      }).then(() => "POST body round-tripped (" + payload.length + " bytes)");
+    })
+  );
+
+  results.push(
+    await selfTestStep("post_empty_body", async () => {
+      const resp = await selfTestSvc(ORIGIN_UPSTREAM + "/api/net-test/echo", { method: "POST" });
+      if (resp.status !== 200) throw new Error("status " + resp.status);
+      return expectJson(resp, (j) => {
+        if (j.method !== "POST") throw new Error("method " + j.method);
+      }).then(() => "empty POST accepted");
+    })
+  );
+
+  results.push(
+    await selfTestStep("redirect_follow", async () => {
+      /* The relay returns the upstream 302 with a rewritten location and the
+       * BROWSER follows it — the correct proxy semantic (same as native).
+       * The test follows the rewritten chain exactly like the browser. */
+      const prefix = __uv$config.prefix || "/service/";
+      let resp = await selfTestSvc(ORIGIN_UPSTREAM + "/api/net-test/redirect", {});
+      let hops = 0;
+      while (resp.status >= 300 && resp.status < 400 && hops < 4) {
+        const loc = resp.headers.get("location");
+        if (!loc || !loc.startsWith(prefix)) throw new Error("redirect location not rewritten: " + loc);
+        const next = decodeURIComponent(loc.slice(prefix.length));
+        resp = await selfTestSvc(next, {});
+        hops++;
+      }
+      if (resp.status !== 200) throw new Error("expected 200 after " + hops + " hops, got " + resp.status);
+      return expectJson(resp, (j) => {
+        if (j.via !== "redirect") throw new Error("redirect not followed");
+      }).then(() => "302 → rewritten location → followed to 200");
+    })
+  );
+
+  results.push(
+    await selfTestStep("cookie_jar", async () => {
+      const real = ORIGIN_UPSTREAM + "/api/net-test/echo";
+      const jar = await openCookieJar(real);
+      if (!jar) throw new Error("cookie jar unavailable");
+      const enc = __uv$config.encodeUrl(real + "?set=1");
+      const req1 = new Request(location.origin + __uv$config.prefix + enc);
+      const ev1 = { request: req1, clientId: "", waitUntil() {}, respondWith() {} };
+      await directBareFetch(ev1, real + "?set=1", jar);
+      await new Promise((r) => setTimeout(r, 250)); // jar writes are async
+      const enc2 = __uv$config.encodeUrl(real + "?read=1");
+      const req2 = new Request(location.origin + __uv$config.prefix + enc2);
+      const ev2 = { request: req2, clientId: "", waitUntil() {}, respondWith() {} };
+      const resp2 = await directBareFetch(ev2, real + "?read=1", jar);
+      return expectJson(resp2, (j) => {
+        if (!j.cookie || j.cookie.indexOf("specter_selftest=") === -1) {
+          throw new Error("set-cookie not replayed — jar lost it");
+        }
+      }).then(() => "set-cookie stored and replayed");
+    })
+  );
+
+  results.push(
+    await selfTestStep("image_subresource", async () => {
+      const resp = await selfTestSvc(ORIGIN_UPSTREAM + "/api/net-test/pix.png", {});
+      if (resp.status !== 200) throw new Error("status " + resp.status);
+      const ct = resp.headers.get("content-type") || "";
+      if (!ct.includes("image/png")) throw new Error("content-type " + ct);
+      const buf = await resp.arrayBuffer();
+      if (buf.byteLength < 60) throw new Error("suspicious size " + buf.byteLength);
+      return "PNG passed through (" + buf.byteLength + " bytes)";
+    })
+  );
+
+  results.push(
+    await selfTestStep("range_streaming", async () => {
+      const resp = await selfTestSvc(ORIGIN_UPSTREAM + "/api/net-test/media", {
+        headers: { range: "bytes=100-299" },
+      });
+      if (resp.status !== 206) throw new Error("expected 206, got " + resp.status);
+      const cr = resp.headers.get("content-range") || "";
+      if (cr.indexOf("bytes 100-299/") === -1) throw new Error("content-range " + cr);
+      const buf = await resp.arrayBuffer();
+      if (buf.byteLength !== 200) throw new Error("slice size " + buf.byteLength);
+      return "206 partial content, exact slice (200 B)";
+    })
+  );
+
+  results.push(
+    await selfTestStep("download_headers", async () => {
+      const resp = await selfTestSvc(ORIGIN_UPSTREAM + "/api/net-test/download", {});
+      const cd = resp.headers.get("content-disposition") || "";
+      if (cd.indexOf("attachment") === -1) throw new Error("content-disposition missing");
+      return "attachment header preserved (" + cd.slice(0, 60) + ")";
+    })
+  );
+
+  results.push(
+    await selfTestStep("document_rewrite", async () => {
+      const real = ORIGIN_UPSTREAM + "/api/net-test/page";
+      const jar = await openCookieJar(real);
+      const enc = __uv$config.encodeUrl(real);
+      const req = new Request(location.origin + __uv$config.prefix + enc, {
+        headers: { accept: "text/html" },
+      });
+      const ev = { request: req, clientId: "", waitUntil() {}, respondWith() {} };
+      const resp = await directDocument(ev, real, jar);
+      const html = await resp.text();
+      const prefix = __uv$config.prefix || "/service/";
+      if (html.indexOf(prefix) === -1) throw new Error("links were not rewritten");
+      if (html.indexOf("specter-client") === -1 && html.indexOf("uv") === -1) {
+        throw new Error("client hook not injected");
+      }
+      return "HTML rewritten + client hook injected";
+    })
+  );
+
+  results.push(
+    await selfTestStep("blocker_precision", async () => {
+      const blocked = (u) => matchBlockRule(new URL(u));
+      const mustBlock = [
+        "https://ads.doubleclick.net/x",
+        "https://www.facebook.com/tr?id=1",
+        "https://pagead2.google.com/syndication",
+      ];
+      for (const u of mustBlock) {
+        if (!blocked(u)) throw new Error("should block " + u);
+      }
+      const mustAllow = [
+        // the old substring matcher broke exactly these shapes:
+        "https://www.google.com/search?q=criteo",
+        "https://example.com/docs/branch.io",
+        "https://www.facebook.com/privacy",
+        "https://www.youtube.com/watch?v=abc",
+        "https://example.com/media.netlify.com.mirror",
+      ];
+      for (const u of mustAllow) {
+        if (blocked(u)) throw new Error("false positive on " + u);
+      }
+      return "rules precise: " + mustBlock.length + " blocked, " + mustAllow.length + " allowed";
+    })
+  );
+
+  reportToClients({ type: "specter:selftest", rev: ENGINE_REV, results, ts: Date.now() });
+}
 
 self.addEventListener("install", () => {
   // activate updates immediately — there is no state worth preserving
