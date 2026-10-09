@@ -36,6 +36,9 @@ export interface EngineResult {
   error: string | null;
   /** where the boot stopped (codec / sw / transport / relay / ok) */
   stage: string;
+  /** the active engine build (ENGINE_REV inside sw.js) — shown in the UI
+   *  so the user can always tell WHICH version they are running. */
+  rev: string | null;
 }
 
 let enginePromise: Promise<EngineResult> | null = null;
@@ -134,7 +137,25 @@ function fail(stage: string, err: unknown): EngineResult {
   // CRITICAL: drop the cached attempt so the next call retries from scratch.
   enginePromise = null;
   engineReady = false;
-  return { ok: false, error: lastError, stage };
+  return { ok: false, error: lastError, stage, rev: cachedRev };
+}
+
+/* The running engine build. Read once from the SW script itself (tiny local
+ * fetch) and cached for the page lifetime — the UI shows it so the user can
+ * always tell which version they are comparing against. */
+let cachedRev: string | null = null;
+async function swEngineRev(): Promise<string | null> {
+  if (cachedRev) return cachedRev;
+  try {
+    const res = await fetch(`${UV_SW}?revprobe=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const m = text.match(/ENGINE_REV\s*=\s*"([^"]+)"/);
+    cachedRev = m ? m[1] : null;
+  } catch {
+    cachedRev = null;
+  }
+  return cachedRev;
 }
 
 /**
@@ -205,7 +226,8 @@ export function ensureUvEngine(): Promise<EngineResult> {
     engineReady = true;
     lastError = null;
     lastStage = "ok";
-    return { ok: true, error: null, stage: "ok" };
+    const rev = await swEngineRev();
+    return { ok: true, error: null, stage: "ok", rev };
   })();
   return enginePromise;
 }

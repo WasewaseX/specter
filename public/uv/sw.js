@@ -38,7 +38,7 @@ const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-14-header-room";
+const ENGINE_REV = "rev-15-open-throttle";
 
 /* ── tracker / ad firewall (parsed-hostname matching) ──────────
  * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
@@ -394,7 +394,52 @@ function applyBareMetaHeaders(target, metaJson) {
   }
 }
 
+/* ── network pacing (browser-style lanes) ─────────────────────────
+ * A modern page fires 100+ parallel subresource requests. On a slow
+ * link that saturates bandwidth (everything half-loads at once) and
+ * floods the relay with simultaneous sockets. A small global queue —
+ * 8 lanes, navigations jump the line — keeps pages loading smoothly
+ * end to end, costs zero extra traffic, and no quality is degraded. */
+const PACE = { max: 8, active: 0, queue: [], seq: 0 };
+function paceAcquire(priority) {
+  return new Promise((resolve) => {
+    if (PACE.active < PACE.max) {
+      PACE.active++;
+      resolve();
+      return;
+    }
+    PACE.queue.push({ resolve: resolve, priority: !!priority, seq: PACE.seq++ });
+  });
+}
+function paceRelease() {
+  PACE.active = Math.max(0, PACE.active - 1);
+  if (!PACE.queue.length) return;
+  let pick = 0;
+  for (let i = 1; i < PACE.queue.length; i++) {
+    const a = PACE.queue[i];
+    const b = PACE.queue[pick];
+    if (
+      (a.priority ? 1 : 0) > (b.priority ? 1 : 0) ||
+      (a.priority === b.priority && a.seq < b.seq)
+    ) {
+      pick = i;
+    }
+  }
+  const next = PACE.queue.splice(pick, 1)[0];
+  PACE.active++;
+  next.resolve();
+}
+
 async function directBareFetch(event, real, jar) {
+  await paceAcquire(event.request.mode === "navigate");
+  try {
+    return await directBareFetchUnpaced(event, real, jar);
+  } finally {
+    paceRelease();
+  }
+}
+
+async function directBareFetchUnpaced(event, real, jar) {
   const request = event.request;
   const target = new URL(real);
   const realOrigin = target.origin;

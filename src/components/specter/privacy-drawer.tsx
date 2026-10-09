@@ -84,6 +84,7 @@ export default function PrivacyDrawer() {
   const bypassFirewallFor = useSpecter((s) => s.bypassFirewallFor);
   const restoreFirewallFor = useSpecter((s) => s.restoreFirewallFor);
   const uvStatus = useSpecter((s) => s.uvStatus);
+  const engineRev = useSpecter((s) => s.engineRev);
   const selfTest = useSpecter((s) => s.selfTest);
   const runSelfTest = useSpecter((s) => s.runSelfTest);
   const panicWipe = useSpecter((s) => s.panicWipe);
@@ -208,6 +209,11 @@ export default function PrivacyDrawer() {
               <DefRow label="Session">
                 <span className="text-zinc-300">
                   SID {sid?.slice(0, 6).toUpperCase() ?? "—"}
+                </span>
+              </DefRow>
+              <DefRow label="Engine build">
+                <span className="text-zinc-300" title="The exact browser-engine version you are running">
+                  {engineRev ?? "—"}
                 </span>
               </DefRow>
               <DefRow label="Queries this session">

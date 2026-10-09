@@ -116,6 +116,8 @@ interface SpecterState {
   uvError: string | null;
   /** user explicitly chose the limited relay viewer after engine failure */
   relayFallbackAck: boolean;
+  /** running engine build (ENGINE_REV) — shown so the user can identify versions */
+  engineRev: string | null;
   /** sites where the tracker firewall is suspended this session (RAM only) */
   bypassHosts: string[];
   /** last tracker blocked, with the precise rule that caught it */
@@ -289,6 +291,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   uvAvailable: false,
   uvStatus: "booting",
   uvError: null,
+  engineRev: null,
   relayFallbackAck: false,
   bypassHosts: [],
   lastBlocked: null,
@@ -331,7 +334,13 @@ export const useSpecter = create<SpecterState>((set, get) => ({
     // Boot the full browser engine (Ultraviolet SW + bare relay).
     const uv = await ensureUvEngine();
     if (uv.ok) {
-      set({ uvStatus: "ready", uvAvailable: true, uvError: null, relayFallbackAck: false });
+      set({
+        uvStatus: "ready",
+        uvAvailable: true,
+        uvError: null,
+        relayFallbackAck: false,
+        engineRev: uv.rev,
+      });
       const { dataSaver, adBlock, bypassHosts } = get();
       void pushUvSettings({ dataSaver, adBlock, bypassHosts });
     } else {
@@ -344,7 +353,13 @@ export const useSpecter = create<SpecterState>((set, get) => ({
     set({ uvStatus: "booting", uvError: null });
     const uv = await retryUvEngine();
     if (uv.ok) {
-      set({ uvStatus: "ready", uvAvailable: true, uvError: null, relayFallbackAck: false });
+      set({
+        uvStatus: "ready",
+        uvAvailable: true,
+        uvError: null,
+        relayFallbackAck: false,
+        engineRev: uv.rev,
+      });
       const { dataSaver, adBlock, bypassHosts } = get();
       void pushUvSettings({ dataSaver, adBlock, bypassHosts });
     } else {

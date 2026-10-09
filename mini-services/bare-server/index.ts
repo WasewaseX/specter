@@ -40,10 +40,68 @@ const H2_REQUIRED_HOSTS = [
   /(^|\.)reddit\.com$/i,
 ];
 
+/* ── HTTP/2 session pool ──────────────────────────────────────────
+ * One pooled h2 session per upstream origin instead of a fresh TLS
+ * handshake per request. Image/CSS storms (wikipedia, reddit) reuse a
+ * warm multiplexed connection — faster on slow client links, far fewer
+ * handshakes, and gentler to CDN connection policies. Sessions idle out
+ * after 45s and the pool is capped (LRU evict). */
+type H2Entry = { session: http2.ClientHttp2Session; lastUsed: number };
+const H2_POOL = new Map<string, H2Entry>();
+const H2_POOL_MAX = 12;
+
+function dropH2Session(origin: string, session: http2.ClientHttp2Session) {
+  const entry = H2_POOL.get(origin);
+  if (entry && entry.session === session) H2_POOL.delete(origin);
+  try {
+    session.close();
+  } catch {
+    /* ignore */
+  }
+}
+
+function acquireH2Session(origin: string): http2.ClientHttp2Session {
+  const now = Date.now();
+  const pooled = H2_POOL.get(origin);
+  if (pooled && !pooled.session.destroyed && !pooled.session.closed) {
+    pooled.lastUsed = now;
+    return pooled.session;
+  }
+  if (pooled) H2_POOL.delete(origin);
+  const session = http2.connect(origin);
+  H2_POOL.set(origin, { session, lastUsed: now });
+  session.once("close", () => dropH2Session(origin, session));
+  session.on("error", () => dropH2Session(origin, session));
+  if (H2_POOL.size > H2_POOL_MAX) {
+    let oldestKey = "";
+    let oldest = Infinity;
+    for (const [key, entry] of H2_POOL) {
+      if (entry.lastUsed < oldest) {
+        oldest = entry.lastUsed;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey && oldestKey !== origin) {
+      const victim = H2_POOL.get(oldestKey);
+      if (victim) dropH2Session(oldestKey, victim.session);
+    }
+  }
+  return session;
+}
+
+const H2_IDLE_SWEEP = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of H2_POOL) {
+    if (now - entry.lastUsed > 45_000) dropH2Session(key, entry.session);
+  }
+}, 20_000);
+if (typeof H2_IDLE_SWEEP.unref === "function") H2_IDLE_SWEEP.unref();
+
 class H2ClientRequest extends PassThrough {
   constructor(url: URL, options: { method?: string; headers?: Record<string, unknown>; signal?: AbortSignal }) {
     super();
-    const session = http2.connect(`https://${url.host}`);
+    const origin = `https://${url.host}`;
+    let session = acquireH2Session(origin);
     const method = (options.method ?? "GET").toUpperCase();
 
     const headers: Record<string, string> = {
@@ -57,12 +115,33 @@ class H2ClientRequest extends PassThrough {
       headers[name] = value;
     }
 
-    const outgoing = session.request(headers);
+    let outgoing: http2.ClientHttp2Stream;
+    try {
+      outgoing = session.request(headers);
+    } catch {
+      /* pooled session died between checkout and request — one fresh retry */
+      dropH2Session(origin, session);
+      session = acquireH2Session(origin);
+      outgoing = session.request(headers);
+    }
+
+    // Pooled session terminated underneath us mid-request → fail THIS
+    // stream (never hang) without tearing down other in-flight streams.
+    const onSessionClosed = () => {
+      if (!outgoing.closed && !outgoing.destroyed && !this.destroyed) {
+        this.emit("error", new Error("upstream h2 session closed"));
+        this.destroy();
+      }
+    };
+    session.once("close", onSessionClosed);
+    outgoing.once("close", () => {
+      session.off("close", onSessionClosed);
+    });
 
     const abort = () => {
       try {
+        // cancel only this stream — the pooled session serves others
         outgoing.close(http2.constants.NGHTTP2_CANCEL);
-        session.close();
       } catch {
         /* ignore */
       }
@@ -111,13 +190,7 @@ class H2ClientRequest extends PassThrough {
       this.emit("error", err);
     });
 
-    outgoing.on("close", () => {
-      try {
-        session.close();
-      } catch {
-        /* ignore */
-      }
-    });
+    // NOTE: the session is POOLED — a stream ending never closes it.
 
     // pipe anything written into this stream straight to the h2 request
     this.pipe(outgoing);
@@ -161,6 +234,40 @@ const nativeHttpsRequest = https.request;
 const PORT = 3030;
 const BARE_DIRECTORY = "/bare/";
 
+/* ── connection policy ─────────────────────────────────────────────
+ * ROOT CAUSE of "CONNECTION_LIMIT_EXCEEDED — Too many keep-alive
+ * connections from this IP address": bare-server-node 2.0.6 INJECTS a
+ * default rate limiter when none is configured — 10 keep-alive requests
+ * per IP per 60s, then a 60s total block (createServer.js:81). One
+ * browser tab fires 100+ parallel requests per page, so every image-
+ * heavy site (BBC, YouTube thumbnails) tripped it within seconds and
+ * stayed broken for the block window. This relay is PRIVATE and
+ * single-user: flood-protection against its only user is nonsense.
+ * Neutralized two independent ways so a library default change can
+ * never re-enable it. */
+const UNLIMITED_CONNECTIONS = {
+  maxConnectionsPerIP: 1_000_000,
+  windowDuration: 60,
+  blockDuration: 0,
+};
+
+/* Shared bounded keep-alive pools for upstream traffic: instead of
+ * unbounded socket storms (per-request TLS handshakes), each origin
+ * reuses up to 48 warm connections. Faster on slow links, fewer
+ * handshakes, friendlier to CDN connection policies. */
+const upstreamHttpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  maxSockets: 48,
+  scheduling: "fifo",
+});
+const upstreamHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  maxSockets: 48,
+  scheduling: "fifo",
+});
+
 const bareServer = createBareServer(BARE_DIRECTORY, {
   logErrors: false,
   // This relay is a PRIVATE mini-service behind the app gateway (never a
@@ -171,7 +278,15 @@ const bareServer = createBareServer(BARE_DIRECTORY, {
   // This sandbox has no IPv6 route — force IPv4 resolution or some upstreams
   // (e.g. YouTube's CDN) fail with FailedToOpenSocket on AAAA records.
   family: 4,
+  httpAgent: upstreamHttpAgent,
+  httpsAgent: upstreamHttpsAgent,
+  connectionLimiter: UNLIMITED_CONNECTIONS,
 });
+
+/* Belt + suspenders: even if a future library version hard-codes limiting,
+ * this private relay never rate-limits its only user. */
+(bareServer as unknown as { checkRateLimit: () => Promise<{ allowed: boolean }> }).checkRateLimit =
+  async () => ({ allowed: true });
 
 /** Next.js rewrites drop the trailing slash — restore it for versioned endpoints. */
 function normalizeBareUrl(url: string | undefined): string | undefined {

@@ -195,3 +195,24 @@ Stage Summary:
 - The actual blocker ("YouTube won't load") was HTTP 431 on watch pages from Node's 16KB header parser — eliminated at every hop (relay 1MB, dev server 1MB, SW cookie cap + header trim), with relay-failure size diagnostics for future debugging.
 - YouTube playback from this sandbox is proven to be YouTube's own IP-policy wall (every known bypass tested and dead in 2026); the engine's playback pipeline is proven working with a real video (play + seek + zero amplification). On residential deployments or after in-engine sign-in, playback follows YouTube's normal rules.
 - P2 roadmap item shipped: the compatibility map separates engine-proven capability from site-side policy, exactly as the review requested.
+
+---
+Task ID: 11
+Agent: Z.ai Code (main)
+Task: Fix user-reported regressions — CONNECTION_LIMIT_EXCEEDED, broken BBC images, slow internet; verify YouTube with screenshot loop; continue roadmap.
+
+Work Log:
+- Reproduced CONNECTION_LIMIT_EXCEEDED live: 10 rapid requests → 429. Traced to bare-server-node 2.0.6 createServer.js:81 — the library INJECTS a default connection limiter (10 keep-alive req/IP/60s + 60s full block) when none is configured. One tab fires 100+ parallel requests per page → every image-heavy site tripped it and stayed broken for the block window. This single default caused all three user complaints (BBC images, bugginess, perceived slowness).
+- mini-services/bare-server/index.ts: neutralized the limiter two independent ways (explicit unlimited connectionLimiter + instance patch of checkRateLimit — private single-user relay must never rate-limit its only user); added bounded keep-alive upstream agents (http/https, maxSockets 48, keepAliveMsecs 15s, fifo) replacing unbounded socket storms; replaced per-request HTTP/2 sessions with a pooled session cache (12 origins LRU, 45s idle sweep, stream-safe abort/close handling) for wikipedia/reddit.
+- public/uv/sw.js (ENGINE_REV → rev-15-open-throttle): added browser-style network pacing — 8 global lanes, navigations jump the queue — so slow links are not saturated by 100-request storms and the relay never sees socket floods. Zero traffic overhead, zero quality degradation.
+- Verified at the wire level: 30 rapid requests → zero 429s; example.com/BBC page/BBC image/wikipedia all 200 through relay; 11/11 in-app diagnostics pass (incl. post_roundtrip, image_subresource).
+- YouTube deep-dive: watch pages + home + search render fully (2 screenshot passes, e2e-shots/yt-loop*.png). Playback wall = YouTube's genuine LOGIN_REQUIRED anti-bot policy for datacenter IPs — proven by the SAME POST returning LOGIN_REQUIRED both directly AND through the relay (playabilityStatus from youtubei/v1/player). Not a code bug; our honest wall UX + compat map already document it. (A missing-Host 400 artifact in curl test harnesses was chased down and eliminated — the SW always sends host in bare meta; relay POST pipeline confirmed byte-perfect.)
+- Version stamp: EngineResult.rev extracted from sw.js during boot → store engineRev → privacy drawer "Engine build" row + diagnostics header ("engine rev-15-open-throttle · 11/11 passed"). User can always tell which build they are comparing.
+- Roadmap status: P1 (blocker bypass + per-rule log UI) and P2 (compat map) were already shipped in cae3476/5ca90d3 — verified present in privacy drawer.
+
+Stage Summary:
+- CONNECTION_LIMIT_EXCEEDED eliminated at the source (library default limiter neutralized, verified 30/30 clean).
+- BBC images: 0 broken (21 loaded + lazy below-fold), hero photos and thumbnails render (e2e-shots/bbc-pass*.png).
+- Network pacing + bounded keep-alive + H2 pooling = materially less bandwidth churn and faster page completion on slow links without any quality reduction.
+- YouTube: everything except playback works through the relay; playback is walled by YouTube's own datacenter-IP policy (LOGIN_REQUIRED), honestly surfaced in-product.
+- Diagnostics 11/11 on rev-15-open-throttle; lint clean; relay supervisor cycle verified (kill → watchdog respawn → healthy).
