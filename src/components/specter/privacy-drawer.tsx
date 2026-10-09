@@ -467,6 +467,50 @@ export default function PrivacyDrawer() {
             </div>
           </section>
 
+          {/* ── compatibility map (P2: code bugs vs upstream limits) ── */}
+          <section className="rounded-xl border border-zinc-800/60 bg-zinc-900/40 p-4">
+            <SectionHeading>SITE COMPATIBILITY</SectionHeading>
+            <div className="mt-2 rounded-lg border border-zinc-800/60 bg-zinc-950/40 p-3">
+              <p className="text-[11px] leading-5 text-zinc-400">
+                From SPECTER&apos;s own test runs. Green = engine-proven. Amber
+                limits are the SITE&apos;S server-side policy toward relays and
+                datacenter IPs — not browser bugs — and they lift on
+                residential networks or after signing in through the engine.
+              </p>
+              <ul className="mt-2 space-y-1.5 font-mono text-[10px]">
+                {[
+                  ["works", "Wikipedia", "full articles + images (HTTP/2 shim)"],
+                  ["works", "Hacker News", "rows, links, navigation"],
+                  ["works", "BBC News", "full-quality images, lazy feed"],
+                  ["works", "video pipeline", "Range streaming, seek, no amplification"],
+                  ["works", "search + downloads", "encrypted search, built-in downloader"],
+                  ["mixed", "YouTube", "browse/search/watch pages OK · playback walled by YouTube's anti-bot policy on datacenter IPs"],
+                  ["mixed", "DuckDuckGo", "serves bot-walls to datacenter IPs"],
+                  ["upstream", "X / Twitter", "X's own anti-bot JS refuses any proxy"],
+                  ["upstream", "Reddit", "network-level 403 for datacenter IPs"],
+                  ["upstream", "Cloudflare challenges", "proof-of-work can't complete through relays (honest notice shown)"],
+                ].map(([status, name, note]) => (
+                  <li key={name} className="flex items-start gap-2 border-b border-zinc-800/40 pb-1.5 last:border-0">
+                    <span
+                      aria-hidden="true"
+                      className={`mt-1 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${
+                        status === "works"
+                          ? "bg-emerald-400"
+                          : status === "mixed"
+                            ? "bg-amber-400"
+                            : "bg-rose-400"
+                      }`}
+                    />
+                    <span className="text-zinc-300">
+                      <b>{name}</b>
+                      <span className="text-zinc-500"> — {note}</span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </section>
+
           {/* ── history vault ──────────────────────────────── */}
           <section className="rounded-xl border border-zinc-800/60 bg-zinc-900/40 p-4">
             <VaultPanel />

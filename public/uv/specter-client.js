@@ -307,8 +307,11 @@
         "font:500 13px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;" +
         "box-shadow:0 8px 28px rgba(0,0,0,.55);cursor:default";
       var text = document.createElement("span");
-      text.textContent = "YouTube demands a sign-in on this network — switch to the embedded player?";
-      text.style.cssText = "color:#e5e7eb";
+      text.innerHTML =
+        "<b style='color:#6ee7b7'>Playback blocked by YouTube</b><br>" +
+        "<span style='color:#9ca3af;font-size:12px'>This network's IP is flagged by YouTube's anti-bot wall (sign-in required). " +
+        "Try the embedded player, sign in through SPECTER, or watch from a residential network — everything else on this page works.</span>";
+      text.style.cssText = "color:#e5e7eb;max-width:60vw";
       var btn = document.createElement("button");
       btn.textContent = "▶ Play";
       btn.style.cssText =

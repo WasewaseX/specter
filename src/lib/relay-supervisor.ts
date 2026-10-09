@@ -52,13 +52,21 @@ function spawnRelay() {
     /* Run under NODE, never bun: Bun's Request drops Node IncomingMessage
      * bodies when bare-server-node builds its upstream fetch (empty POSTs →
      * every POST-based site API breaks — this is what killed YouTube).
-     * Node 24 runs index.ts natively via type stripping. */
-    const child = spawn("node", ["index.ts"], {
-      cwd: RELAY_DIR,
-      stdio: "ignore",
-      detached: false,
-      env: process.env,
-    });
+     * Node 24 runs index.ts natively via type stripping.
+     * --max-http-header-size=1MB: bare v3 carries the upstream request's
+     * headers in x-bare-headers chunks; long sessions (YouTube cookies,
+     * big referers) can exceed Node's 16KB default → HTTP 431 for exactly
+     * the pages that matter (watch pages). 1MB removes the whole class. */
+    const child = spawn(
+      "node",
+      ["--max-http-header-size=1048576", "index.ts"],
+      {
+        cwd: RELAY_DIR,
+        stdio: "ignore",
+        detached: false,
+        env: process.env,
+      }
+    );
     child.on("exit", (code) => {
       starting = false;
       announcedUp = false;
@@ -93,13 +101,18 @@ export function startRelaySupervisor() {
     if (!up) spawnRelay();
     else console.log("[relay-supervisor] relay already up on :3030");
   });
-  // 5s guard: keeps the relay-down window (and therefore user-visible relay
-  // errors) as short as possible; the service worker additionally probes and
-  // retries through the restart window.
-  const guard = setInterval(() => {
+  /* Self-chaining watchdog — deliberately NOT setInterval + unref: some dev
+   * runtimes drop unreferenced timers from instrumentation contexts. A
+   * chaining timer re-arms itself after every check and LOGS what it saw, so
+   * a silent stop is impossible. */
+  const watchdog = () => {
     void relayUp().then((up) => {
-      if (!up) spawnRelay();
+      if (!up) {
+        console.log("[relay-supervisor] watchdog: relay down — respawning");
+        spawnRelay();
+      }
+      setTimeout(watchdog, up ? 5_000 : 1_500);
     });
-  }, 5_000);
-  guard.unref?.();
+  };
+  setTimeout(watchdog, 5_000);
 }

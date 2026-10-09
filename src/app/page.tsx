@@ -51,6 +51,19 @@ export default function Home() {
           rev: typeof data.rev === "string" ? data.rev : null,
           ts: Number(data.ts) || Date.now(),
         });
+      } else if (data.type === "specter:relay-debug") {
+        // transport-level failure diagnostics (code + envelope size) —
+        // surfaced in the console only; nothing is persisted (RAM-only rule)
+        console.info(
+          "[specter] relay failure:",
+          String(data.code),
+          "HTTP",
+          String(data.status),
+          "meta",
+          String(data.metaBytes),
+          "B →",
+          String(data.target)
+        );
       }
     });
     return unsubscribe;

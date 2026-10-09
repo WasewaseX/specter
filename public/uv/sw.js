@@ -38,7 +38,7 @@ const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-13-relay-heal";
+const ENGINE_REV = "rev-14-header-room";
 
 /* ── tracker / ad firewall (parsed-hostname matching) ──────────
  * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
@@ -411,6 +411,7 @@ async function directBareFetch(event, real, jar) {
       // upstream (site: same-origin is a lie cross-origin); drop the family.
       continue;
     }
+    if (lower === "upgrade-insecure-requests") continue; // hop-specific, meaningless to the upstream
     upstreamHeaders[name] = value;
   }
   upstreamHeaders["host"] = target.host;
@@ -428,7 +429,14 @@ async function directBareFetch(event, real, jar) {
     /* no referer — fine */
   }
   const cookieHeader = await cookieHeaderFor(jar);
-  if (cookieHeader) upstreamHeaders["cookie"] = cookieHeader;
+  if (cookieHeader) {
+    /* RAM jar can only grow within a session; a runaway cookie header would
+     * blow every HTTP parser's header limit (HTTP 431) for exactly the big
+     * sites. 12KB is far above any real session (YouTube ≈ 2KB) and keeps
+     * the whole bare envelope comfortably inside even 64KB parsers. */
+    upstreamHeaders["cookie"] =
+      cookieHeader.length > 12_000 ? cookieHeader.slice(-12_000) : cookieHeader;
+  }
   if (!upstreamHeaders["accept-language"]) upstreamHeaders["accept-language"] = "en-US,en;q=0.9";
   if (!upstreamHeaders["accept"]) upstreamHeaders["accept"] = "*/*";
 
@@ -519,6 +527,13 @@ async function directBareFetch(event, real, jar) {
     }
     if (kind === "unreachable") {
       RELAY_STATE.healthy = false;
+      reportToClients({
+        type: "specter:relay-debug",
+        code,
+        status: relayResp.status,
+        metaBytes: JSON.stringify(upstreamHeaders).length,
+        target: target.host,
+      });
       // supervisor usually respawns within seconds — one healed retry
       if (await healRelay()) {
         try {
