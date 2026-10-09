@@ -305,12 +305,23 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // plain health endpoint for the gateway / diagnostics
+  // plain health + identity endpoint for the gateway / diagnostics /
+  // relay supervisor. The SUPERVISOR uses `runtime` to prove the port is
+  // held by a node relay — this sandbox boots mini services with
+  // `bun run dev`, and a bun-owned relay silently drops POST bodies
+  // (the historical YouTube killer), so a bun listener must be evicted.
   res.writeHead(200, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
   });
-  res.end(JSON.stringify({ service: "specter-bare-relay", status: "online" }));
+  res.end(
+    JSON.stringify({
+      service: "specter-bare-relay",
+      status: "online",
+      runtime: (globalThis as { Bun?: unknown }).Bun !== undefined ? "bun" : "node",
+      pid: process.pid,
+    })
+  );
 });
 
 httpServer.on("upgrade", (req, socket, head) => {

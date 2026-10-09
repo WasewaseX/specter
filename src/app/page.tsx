@@ -24,6 +24,7 @@ export default function Home() {
   const handlePageMessage = useSpecter((s) => s.handlePageMessage);
   const recordBlocked = useSpecter((s) => s.recordBlocked);
   const setSelfTest = useSpecter((s) => s.setSelfTest);
+  const setNetLegs = useSpecter((s) => s.setNetLegs);
 
   useEffect(() => {
     void boot();
@@ -51,6 +52,15 @@ export default function Home() {
           rev: typeof data.rev === "string" ? data.rev : null,
           ts: Number(data.ts) || Date.now(),
         });
+      } else if (data.type === "specter:netlegs") {
+        setNetLegs({
+          legA: typeof data.legA === "number" ? data.legA : null,
+          legB: typeof data.legB === "number" ? data.legB : null,
+          kbps: typeof data.kbps === "number" ? data.kbps : null,
+          probeBytes: typeof data.probeBytes === "number" ? data.probeBytes : 0,
+          error: typeof data.error === "string" ? data.error : null,
+          ts: Number(data.ts) || Date.now(),
+        });
       } else if (data.type === "specter:relay-debug") {
         // transport-level failure diagnostics (code + envelope size) —
         // surfaced in the console only; nothing is persisted (RAM-only rule)
@@ -67,7 +77,7 @@ export default function Home() {
       }
     });
     return unsubscribe;
-  }, [recordBlocked, setSelfTest]);
+  }, [recordBlocked, setSelfTest, setNetLegs]);
 
   // messages from injected page hooks: address-bar sync + popup → tab
   useEffect(() => {

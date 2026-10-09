@@ -4,7 +4,7 @@
   "private": true,
   "description": "SPECTER — TompHTTP Bare v3 relay (mini service). Open-source: github.com/tomphttp/bare-server-node",
   "scripts": {
-    "dev": "bun --hot index.ts"
+    "dev": "node --max-http-header-size=1048576 index.ts"
   },
   "dependencies": {
     "@tomphttp/bare-server-node": "^2.0.6"

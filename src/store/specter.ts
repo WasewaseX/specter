@@ -73,6 +73,19 @@ export interface SelfTestResult {
   ms: number;
 }
 
+/** Two-leg network speed measurement (review recommendation #1, RAM only). */
+export interface NetLegsResult {
+  /** browser → preview edge round-trip, ms (median of 4) */
+  legA: number | null;
+  /** preview relay → open internet round-trip, ms (median of 4) */
+  legB: number | null;
+  /** sustained download through the relay, KB/s */
+  kbps: number | null;
+  probeBytes: number;
+  error: string | null;
+  ts: number;
+}
+
 /** Lifecycle of the Ghost Browser engine (never silently ambiguous). */
 export type UvStatus = "booting" | "ready" | "failed";
 
@@ -128,6 +141,11 @@ interface SpecterState {
     results: SelfTestResult[] | null;
     rev: string | null;
     ts: number | null;
+  };
+  /** two-leg speed check run by the engine SW */
+  netLegs: {
+    running: boolean;
+    result: NetLegsResult | null;
   };
   dataSaver: boolean;
   adBlock: boolean;
@@ -187,6 +205,10 @@ interface SpecterState {
   setSelfTest: (r: { results: SelfTestResult[]; rev: string | null; ts: number }) => void;
   /** Run the engine's network-pipeline diagnostics. */
   runSelfTest: () => void;
+  /** Receive two-leg speed results from the engine SW. */
+  setNetLegs: (r: NetLegsResult) => void;
+  /** Run the engine's two-leg speed check. */
+  runNetLegs: () => void;
 
   createVault: (pass: string, confirm: string) => Promise<string | null>;
   unlockVault: (pass: string) => Promise<string | null>;
@@ -296,6 +318,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   bypassHosts: [],
   lastBlocked: null,
   selfTest: { running: false, results: null, rev: null, ts: null },
+  netLegs: { running: false, result: null },
   /* Data Saver is strictly optional — OFF by default so every site renders at
    * full quality. Bandwidth efficiency never depended on it anyway: media is
    * Range-streamed (only watched seconds download) and trackers are blocked
@@ -401,6 +424,35 @@ export const useSpecter = create<SpecterState>((set, get) => ({
 
   setSelfTest: ({ results, rev, ts }) => {
     set({ selfTest: { running: false, results, rev, ts } });
+  },
+
+  setNetLegs: (result) => {
+    set({ netLegs: { running: false, result } });
+  },
+
+  runNetLegs: () => {
+    if (get().netLegs.running) return;
+    set({ netLegs: { running: true, result: null } });
+    void postUvMessage({ type: "specter:netlegs" });
+    // safety net: if the engine never answers (dead SW), stop "running"
+    setTimeout(() => {
+      const nl = get().netLegs;
+      if (nl.running && !nl.result) {
+        set({
+          netLegs: {
+            running: false,
+            result: {
+              legA: null,
+              legB: null,
+              kbps: null,
+              probeBytes: 0,
+              error: "engine SW did not answer — retry the browser engine",
+              ts: Date.now(),
+            },
+          },
+        });
+      }
+    }, 30000);
   },
 
   runSelfTest: () => {

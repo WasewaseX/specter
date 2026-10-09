@@ -216,3 +216,22 @@ Stage Summary:
 - Network pacing + bounded keep-alive + H2 pooling = materially less bandwidth churn and faster page completion on slow links without any quality reduction.
 - YouTube: everything except playback works through the relay; playback is walled by YouTube's own datacenter-IP policy (LOGIN_REQUIRED), honestly surfaced in-product.
 - Diagnostics 11/11 on rev-15-open-throttle; lint clean; relay supervisor cycle verified (kill → watchdog respawn → healthy).
+
+---
+Task ID: 12
+Agent: Z.ai Code (main)
+Task: External review follow-up — kill the recurring bun-relay regression at the source, implement two-leg speed measurement (review #1), hybrid direct-open option (review §5.4), full E2E re-verification; push to GitHub
+
+Work Log:
+- LIVE-REPRODUCED the "second version" regression: the sandbox boot re-launches mini services with `bun run dev` → the relay on :3030 was OWNED BY BUN again (pid 941) — the exact runtime that silently drops POST bodies (the historical YouTube killer). The old supervisor only checked "is the port up" and adopted the impostor. This is why the app felt buggy this session while iwara streaming (GET /api/stream, relay-independent) kept working.
+- FIX LAYER 1 (source): mini-services/bare-server/package.json dev script now runs `node --max-http-header-size=1048576 index.ts` — even the sandbox's own bun launcher executes node.
+- FIX LAYER 2 (identity): relay serves GET /specter-identity → {service, status, runtime: node|bun, pid}.
+- FIX LAYER 3 (supervisor, src/lib/relay-supervisor.ts): supervision is now an IDENTITY check, not a port check — ensureRelay() asks the listener for its runtime; any non-node listener is evicted (SIGKILL via /proc/net/tcp→inode→pid scan, no external tools) and replaced with the node relay. Watchdog re-checks identity every 5s. LIVE-TESTED the full hijack cycle: bun grabbed :3030 → detected ("held by non-node runtime (bun) — POST bodies would be dropped, evicting") → killed → node respawned, all within one watchdog cycle.
+- REVIEW #1 SHIPPED (two-leg measurement): sw.js rev-16-net-legs message handler `specter:netlegs` — Leg A = browser→preview edge (median of 4 same-origin probes), Leg B = relay→open internet (median of 4 full-pipeline bare fetches to example.com), plus sustained relay throughput (400KB via speed.cloudflare.com). Privacy drawer NETWORK SPEED panel renders both legs + throughput + an honest verdict (slow Leg A = your link/preview host; slow Leg B = relay host route, "engine tuning cannot change this — a different relay host would"). Nothing stored, ~9 tiny requests, on demand only.
+- REVIEW §5.4 SHIPPED (hybrid direct/proxy): upstream-class error pages now offer "Open without the relay ↗" (amber, honest micro-copy: uses your real IP, only for sites your region allows, nothing logged) — cross-origin navigations bypass the SW so this genuinely opens outside the relay. Verified rendered with real code surfaced (UNKNOWN — The remote rejected the request) + Retry now.
+- VERIFIED E2E (agent-browser, fresh session, screenshots in e2e-shots/): BBC News 0 broken images (21 loaded + lazy; scrolled double-check; hero photos render full quality); YouTube home full chrome → in-frame search "big buck bunny" → 20 results full thumbnails → watch page fully rendered (title/channel/upnext/comments) with the honest playback-wall banner (YouTube datacenter-IP policy = upstream, not code); diagnostics 11/11 on rev-16-net-legs; NETWORK SPEED measured live: Leg A 16ms / Leg B 907ms / 4.27 MB/s relay throughput; mobile 390px drawer renders cleanly; zero console errors; tsc + eslint clean; controlled dev-server restart verified the identity adoption path ("relay healthy on :3030 (node, pid=…)").
+
+Stage Summary:
+- The bun-relay regression is now structurally impossible: dev script runs node, the relay self-identifies, and the supervisor evicts impostors — proven by a live hijack test.
+- The review's speed methodology is now IN the product: the user can measure both legs + relay throughput from PRIVACY CONTROL → NETWORK SPEED and tell whether the bottleneck is their link, the relay host, or the site itself — the honest answer to "my internet is very slow" (this sandbox: Leg A 16ms is fast, Leg B ~0.9s is the relay host's outbound route, 4.27 MB/s sustained).
+- Hybrid direct/proxy option shipped on upstream refusals; all baselines re-verified (BBC images, YouTube browse/search/watch, 11/11 pipeline, mobile layout).

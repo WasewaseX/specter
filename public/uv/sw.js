@@ -38,7 +38,7 @@ const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-15-open-throttle";
+const ENGINE_REV = "rev-16-net-legs";
 
 /* ── tracker / ad firewall (parsed-hostname matching) ──────────
  * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
@@ -783,6 +783,16 @@ function errorPage(real, err) {
     headline = "◈ Site unreachable through the relay";
     note = "The site refused or dropped the relay's connection (anti-bot or datacenter-IP policy). Retrying sometimes helps; some sites only work from residential networks.";
   }
+  /* Hybrid direct/proxy option (review §5.4): when the RELAY is alive but the
+   * SITE refused it, offer the honest escape hatch — open the site directly
+   * (outside the engine, from the user's own IP). Cross-origin navigations
+   * are not controlled by this SW, so this genuinely bypasses the relay. */
+  const upstreamRefused = kind === "upstream" || /UPSTREAM|FETCH|SOCKET|DNS|ECONN/i.test(code);
+  const safeReal = String(real || "").replace(/[<>&"'`]/g, "");
+  const directOption =
+    upstreamRefused && /^https?:\/\//i.test(safeReal)
+      ? `\n<a class="direct" href="${safeReal}" target="_blank" rel="noopener noreferrer">Open without the relay ↗</a>\n<p class="micro">Uses your real IP and your regular network — only for sites your region allows. Nothing is logged either way.</p>`
+      : "";
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Specter — site unreachable</title><style>
 html,body{margin:0;height:100%;background:#09090b;color:#e4e4e7;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
 .wrap{max-width:560px;margin:0 auto;padding:48px 24px}
@@ -792,11 +802,14 @@ code{color:#34d399;font-size:12px}
 button{margin-top:22px;border:1px solid #10b981;background:transparent;color:#6ee7b7;border-radius:8px;padding:9px 18px;font:inherit;cursor:pointer}
 button:hover{background:rgba(16,185,129,.12)}
 .note{margin-top:18px;font-size:12px;color:#71717a}
+a.direct{display:inline-block;margin-top:20px;border:1px solid #b45309;color:#fbbf24;border-radius:8px;padding:9px 18px;font:inherit;cursor:pointer;text-decoration:none}
+a.direct:hover{background:rgba(251,191,36,.1)}
+p.micro{margin-top:8px;font-size:11px;color:#71717a}
 </style></head><body><div class="wrap">
 <h1>${headline}</h1>
 <p><code>${(code ? code + " — " : "") + raw.slice(0, 240)}</code></p>
 <p class="note">${note}</p>
-<button onclick="location.reload()">Retry now</button>
+<button onclick="location.reload()">Retry now</button>${directOption}
 <script>(function(){try{var k="specter:autoRetry";var n=Number(sessionStorage.getItem(k))||0;if(n<1){sessionStorage.setItem(k,String(n+1));setTimeout(function(){location.reload()},1400)}}catch(e){}})();<\/script>
 </div></body></html>`;
   return new Response(html, {
@@ -1008,6 +1021,92 @@ self.addEventListener("fetch", (event) => {
 });
 
 /* ── settings channel (app → SW, RAM only) ──────────────────── */
+/* ── two-leg network speed check (review recommendation #1) ──
+ * Measure the two network legs INDEPENDENTLY:
+ *   Leg A — your device ↔ SPECTER preview edge (same-origin probe).
+ *   Leg B — SPECTER's relay ↔ the open internet (full pipeline probe).
+ * This is the honest way to answer "why is it slow": a slow Leg B means the
+ * relay host's route is the bottleneck (engine tuning cannot fix that; a
+ * different relay host would); a slow Leg A is your own link (a VPN on the
+ * same site is the fair comparison). Nothing is stored — RAM for this
+ * session only, ~9 tiny requests, run only when the user asks. */
+function medianOf(arr) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+async function runNetLegs() {
+  const out = { legA: null, legB: null, kbps: null, probeBytes: 0, error: null };
+  const prefix = (__uv$config && __uv$config.prefix) || "/service/";
+  const syntheticEvent = (real, init) => {
+    const enc = __uv$config.encodeUrl(real);
+    const request = new Request(location.origin + prefix + enc, init || undefined);
+    return { request, clientId: "", waitUntil() {}, respondWith() {} };
+  };
+  try {
+    /* Leg A — same-origin tiny probe (browser → preview edge → back). */
+    const aSamples = [];
+    for (let i = 0; i < 4; i++) {
+      try {
+        const t0 = performance.now();
+        const r = await fetch("/api/net-test/pix.png?legs=" + Date.now() + "-" + i, {
+          cache: "no-store",
+        });
+        await r.arrayBuffer();
+        if (r.ok) aSamples.push(performance.now() - t0);
+      } catch (e) {
+        /* sample skipped */
+      }
+    }
+    out.legA = aSamples.length ? Math.round(medianOf(aSamples)) : null;
+  } catch (e) {
+    /* leg A unavailable */
+  }
+  try {
+    /* Leg B — through the engine's real relay pipeline to a tiny,
+     * globally-anycast page (relay → open internet → back). */
+    const real = "https://example.com/?specter-legs=" + Date.now();
+    const jar = await openCookieJar(real);
+    const bSamples = [];
+    for (let i = 0; i < 4; i++) {
+      try {
+        const t0 = performance.now();
+        const resp = await directBareFetch(
+          syntheticEvent(real + "-" + i, { headers: { accept: "text/html" } }),
+          real + "-" + i,
+          jar
+        );
+        await resp.arrayBuffer();
+        if (resp.status === 200) bSamples.push(performance.now() - t0);
+      } catch (e) {
+        /* sample skipped */
+      }
+    }
+    out.legB = bSamples.length ? Math.round(medianOf(bSamples)) : null;
+  } catch (e) {
+    out.error = "leg-b: " + String((e && e.message) || e).slice(0, 120);
+  }
+  try {
+    /* Sustained throughput through the same relay path (≈400 KB binary).
+     * This is the number to compare against a VPN's download speed. */
+    const bytes = 400000;
+    const media = "https://speed.cloudflare.com/__down?bytes=" + bytes;
+    const jar = await openCookieJar(media);
+    const t0 = performance.now();
+    const resp = await directBareFetch(syntheticEvent(media), media, jar);
+    const buf = await resp.arrayBuffer();
+    const ms = performance.now() - t0;
+    if (resp.ok && buf.byteLength > 10000 && ms > 0) {
+      out.probeBytes = buf.byteLength;
+      out.kbps = Math.round(buf.byteLength / 1024 / (ms / 1000));
+    }
+  } catch (e) {
+    if (!out.error) out.error = "throughput: " + String((e && e.message) || e).slice(0, 120);
+  }
+  reportToClients({ type: "specter:netlegs", ...out, ts: Date.now() });
+}
+
 self.addEventListener("message", (event) => {
   const d = event.data || {};
   if (d.type === "specter:settings") {
@@ -1021,6 +1120,9 @@ self.addEventListener("message", (event) => {
   }
   if (d.type === "specter:selftest") {
     void runSelfTest();
+  }
+  if (d.type === "specter:netlegs") {
+    void runNetLegs();
   }
 });
 

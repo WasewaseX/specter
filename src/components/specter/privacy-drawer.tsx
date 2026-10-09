@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { Activity, Flame, Loader2, ShieldCheck, ShieldOff, X, Zap } from "lucide-react";
+import { Activity, Flame, Gauge, Loader2, ShieldCheck, ShieldOff, X, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 import { useSpecter } from "@/store/specter";
+import type { NetLegsResult } from "@/store/specter";
 import VaultPanel from "./vault-panel";
 
 function DefRow({ label, children }: { label: string; children: ReactNode }) {
@@ -87,6 +88,8 @@ export default function PrivacyDrawer() {
   const engineRev = useSpecter((s) => s.engineRev);
   const selfTest = useSpecter((s) => s.selfTest);
   const runSelfTest = useSpecter((s) => s.runSelfTest);
+  const netLegs = useSpecter((s) => s.netLegs);
+  const runNetLegs = useSpecter((s) => s.runNetLegs);
   const panicWipe = useSpecter((s) => s.panicWipe);
   const { toast } = useToast();
 
@@ -138,8 +141,46 @@ export default function PrivacyDrawer() {
     runSelfTest();
   };
 
+  const handleRunNetLegs = () => {
+    if (uvStatus !== "ready") {
+      toast({
+        title: "Engine offline",
+        description: "The browser engine must be running to measure the relay path.",
+      });
+      return;
+    }
+    runNetLegs();
+  };
+
+  const legVerdict = (r: NetLegsResult | null): { text: string; tone: string } => {
+    if (!r) return { text: "", tone: "text-zinc-500" };
+    if (r.error && r.legA === null && r.legB === null)
+      return { text: "Measurement failed — " + r.error, tone: "text-red-300" };
+    const aSlow = r.legA !== null && r.legA > 800;
+    const bSlow = r.legB !== null && r.legB > 800;
+    if (aSlow && !bSlow)
+      return {
+        text: "Leg A is the bottleneck: your connection to the SPECTER preview is slow. Compare the same site against your VPN — if the VPN is faster here, the preview host is the limiting factor.",
+        tone: "text-amber-300",
+      };
+    if (bSlow)
+      return {
+        text: "Leg B is the bottleneck: the relay host's route to websites is slow. Engine tuning cannot change this — hosting the relay closer to you (or with better peering) would.",
+        tone: "text-amber-300",
+      };
+    if (r.legA !== null && r.legB !== null)
+      return {
+        text: "Both legs are fast — if a specific site still feels slow, that site is pacing or rejecting relay traffic (anti-bot), not your link or the engine.",
+        tone: "text-emerald-300",
+      };
+    return { text: "Partial measurement — " + (r.error ?? "some probes failed"), tone: "text-zinc-400" };
+  };
+
   const fmtBytes = (b: number) =>
     b < 1024 ? `${b} B` : b < 1024 * 1024 ? `${(b / 1024).toFixed(1)} KB` : `${(b / (1024 * 1024)).toFixed(1)} MB`;
+
+  const fmtSpeed = (kbps: number) =>
+    kbps >= 1024 ? `${(kbps / 1024).toFixed(2)} MB/s` : `${kbps} KB/s`;
 
   return (
     <div className="fixed inset-0 z-50">
@@ -469,6 +510,85 @@ export default function PrivacyDrawer() {
                     ))}
                   </ul>
                 </div>
+              ) : null}
+            </div>
+          </section>
+
+          {/* ── network speed (two-leg measurement) ────── */}
+          <section>
+            <SectionHeading>NETWORK SPEED</SectionHeading>
+            <div className="mt-2 rounded-lg border border-zinc-800/60 bg-zinc-900/40 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] leading-5 text-zinc-400">
+                  Measures the two legs separately — you → SPECTER (Leg A) and
+                  SPECTER&apos;s relay → the internet (Leg B) — plus sustained
+                  relay throughput. Tells you honestly whether the bottleneck is
+                  your link, the relay host, or the site itself. ~9 tiny
+                  requests, once, on request. Nothing is stored.
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleRunNetLegs}
+                  disabled={netLegs.running}
+                  aria-label="Measure network speed"
+                  className="shrink-0 bg-emerald-400 font-mono text-[10px] uppercase tracking-widest text-zinc-950 hover:bg-emerald-300"
+                >
+                  {netLegs.running ? (
+                    <Loader2 className="mr-1 h-3 w-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Gauge className="mr-1 h-3 w-3" aria-hidden="true" />
+                  )}
+                  {netLegs.running ? "Measuring" : "Measure"}
+                </Button>
+              </div>
+
+              {netLegs.running ? (
+                <p aria-live="polite" className="mt-2 font-mono text-[10px] text-zinc-500">
+                  probing both legs… (~10 s)
+                </p>
+              ) : null}
+
+              {!netLegs.running && netLegs.result ? (
+                <div aria-live="polite" className="mt-2">
+                  <div className="grid grid-cols-3 gap-2 font-mono text-[11px]">
+                    <div className="rounded border border-zinc-800/60 bg-zinc-950/40 px-2 py-2 text-center">
+                      <p className="text-[9px] uppercase tracking-widest text-zinc-500">Leg A</p>
+                      <p className="mt-1 text-zinc-100">
+                        {netLegs.result.legA !== null ? `${netLegs.result.legA} ms` : "—"}
+                      </p>
+                      <p className="mt-0.5 text-[9px] text-zinc-500">you → specter</p>
+                    </div>
+                    <div className="rounded border border-zinc-800/60 bg-zinc-950/40 px-2 py-2 text-center">
+                      <p className="text-[9px] uppercase tracking-widest text-zinc-500">Leg B</p>
+                      <p className="mt-1 text-zinc-100">
+                        {netLegs.result.legB !== null ? `${netLegs.result.legB} ms` : "—"}
+                      </p>
+                      <p className="mt-0.5 text-[9px] text-zinc-500">relay → internet</p>
+                    </div>
+                    <div className="rounded border border-zinc-800/60 bg-zinc-950/40 px-2 py-2 text-center">
+                      <p className="text-[9px] uppercase tracking-widest text-zinc-500">Relay ↓</p>
+                      <p className="mt-1 text-zinc-100">
+                        {netLegs.result.kbps !== null ? fmtSpeed(netLegs.result.kbps) : "—"}
+                      </p>
+                      <p className="mt-0.5 text-[9px] text-zinc-500">
+                        {netLegs.result.probeBytes > 0
+                          ? `of ${fmtBytes(netLegs.result.probeBytes)}`
+                          : "sustained"}
+                      </p>
+                    </div>
+                  </div>
+                  <p className={`mt-2 text-[10px] leading-4 ${legVerdict(netLegs.result).tone}`}>
+                    {legVerdict(netLegs.result).text}
+                  </p>
+                </div>
+              ) : null}
+
+              {!netLegs.running && !netLegs.result ? (
+                <p className="mt-2 font-mono text-[10px] text-zinc-500">
+                  no measurement yet — press Measure. Fair VPN comparison: open
+                  the same site over your VPN and time it by hand.
+                </p>
               ) : null}
             </div>
           </section>
