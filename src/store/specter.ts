@@ -2,7 +2,12 @@
 
 /**
  * SPECTER — central client state (zustand).
- * This store is the single contract between the crypto/session layer and the UI.
+ * Single contract between the crypto/session layer, the tabbed Ghost Browser
+ * (Ultraviolet engine) and the UI.
+ *
+ * Privacy: nothing here is persisted — tabs, history and stats live in RAM
+ * only and die with the page. The settings object mirrored into
+ * localStorage carries booleans only (needed by the injected page hook).
  */
 
 import { create } from "zustand";
@@ -13,6 +18,7 @@ import {
   uvEngineLoaded,
   uvHref,
   uvRealUrl,
+  pushUvSettings,
 } from "@/lib/uv-browser";
 import {
   vaultCreate,
@@ -33,6 +39,29 @@ export interface SearchResult {
   rank: number;
 }
 
+export type TabKind = "newtab" | "search" | "web";
+
+export interface BrowserTab {
+  id: string;
+  kind: TabKind;
+  title: string;
+  /** web tabs: current real URL */
+  url: string | null;
+  /** search tabs: the query */
+  query: string | null;
+  history: string[];
+  historyIndex: number;
+  loading: boolean;
+  nonce: number;
+}
+
+export interface BrowserStats {
+  blocked: number;
+  imagesCompressed: number;
+  bytesSaved: number;
+  videosDeferred: number;
+}
+
 type SearchPhase = "idle" | "searching" | "done" | "error";
 
 interface SpecterState {
@@ -44,8 +73,8 @@ interface SpecterState {
   sessionQueryCount: number;
 
   // ── search ─────────────────────────────────────────────────
-  query: string; // input value
-  activeQuery: string; // last executed query
+  query: string;
+  activeQuery: string;
   phase: SearchPhase;
   results: SearchResult[];
   tookMs: number;
@@ -54,19 +83,14 @@ interface SpecterState {
   safeSearch: boolean;
   recencyDays: number | null;
 
-  // ── ghost browser ──────────────────────────────────────────
-  viewerOpen: boolean;
-  viewerSrc: string | null;
-  viewerUrl: string | null; // real (decrypted) URL currently shown
-  viewerStack: string[];
-  viewerIndex: number;
-  viewerLoading: boolean;
-  /** true = hardened Ghost relay (scripts stripped); false = full Ghost Browser (Ultraviolet engine). */
-  viewerGhost: boolean;
-  /** true when the full browser engine (service worker + bare relay) booted successfully. */
+  // ── ghost browser (tabbed, Min-style) ──────────────────────
+  tabs: BrowserTab[];
+  activeTabId: string | null;
   uvAvailable: boolean;
-  /** bumped to force an iframe remount when a hard reload is required (ghost mode). */
-  viewerNonce: number;
+  dataSaver: boolean;
+  adBlock: boolean;
+  readerOn: boolean;
+  stats: BrowserStats;
 
   // ── privacy drawer ─────────────────────────────────────────
   drawerOpen: boolean;
@@ -84,15 +108,25 @@ interface SpecterState {
   setSafeSearch: (v: boolean) => void;
   setRecencyDays: (v: number | null) => void;
 
-  openViewer: (url: string) => Promise<void>;
-  viewerNavigate: (url: string) => Promise<void>;
-  viewerGo: (delta: number) => Promise<void>;
-  viewerReload: () => Promise<void>;
-  viewerLoaded: () => Promise<void>;
+  newTab: (opts?: { url?: string; kind?: TabKind; query?: string }) => string;
+  closeTab: (id: string) => void;
+  activateTab: (id: string) => void;
+  /** Open a URL with the full Ghost Browser. Reuses a new-tab surface. */
+  openInBrowser: (url: string, opts?: { background?: boolean }) => void;
+  /** Omnibox submit: URL → browse, words → encrypted search. */
+  omniboxNavigate: (raw: string) => Promise<void>;
+  tabNavigate: (url: string) => Promise<void>;
+  tabGo: (delta: number) => Promise<void>;
+  tabReload: () => Promise<void>;
+  tabLoaded: () => Promise<void>;
   /** Poll hook: reconcile SPA (pushState) navigations inside the frame. */
-  viewerSync: () => void;
-  toggleViewerMode: () => Promise<void>;
-  closeViewer: () => void;
+  tabSync: () => void;
+  /** Message from the injected page hook (specter-client.js). */
+  handlePageMessage: (data: Record<string, unknown>) => void;
+  toggleReader: () => void;
+  setDataSaver: (v: boolean) => void;
+  setAdBlock: (v: boolean) => void;
+  addStats: (delta: Partial<BrowserStats>) => void;
   setDrawerOpen: (v: boolean) => void;
 
   createVault: (pass: string, confirm: string) => Promise<string | null>;
@@ -104,6 +138,76 @@ interface SpecterState {
 
 function shortSessionId(sid: string): string {
   return sid.slice(0, 6).toUpperCase();
+}
+
+let tabCounter = 0;
+function freshTabId(): string {
+  tabCounter += 1;
+  return `t${Date.now().toString(36)}${tabCounter}`;
+}
+
+/** Deterministic first tab — server and client renders must match exactly. */
+const INITIAL_TAB: BrowserTab = {
+  id: "t0",
+  kind: "newtab",
+  title: "New Tab",
+  url: null,
+  query: null,
+  history: [],
+  historyIndex: -1,
+  loading: false,
+  nonce: 0,
+};
+
+function makeTab(opts?: { url?: string; kind?: TabKind; query?: string }): BrowserTab {
+  const kind: TabKind = opts?.kind ?? (opts?.url ? "web" : "newtab");
+  const url = opts?.url ?? null;
+  const query = opts?.query ?? null;
+  return {
+    id: freshTabId(),
+    kind,
+    title:
+      kind === "web" && url
+        ? hostOf(url)
+        : kind === "search" && query
+          ? query
+          : "New Tab",
+    url,
+    query,
+    history: url ? [url] : [],
+    historyIndex: url ? 0 : -1,
+    loading: Boolean(url),
+    nonce: 0,
+  };
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url.slice(0, 32);
+  }
+}
+
+function looksLikeUrl(raw: string): boolean {
+  const t = raw.trim();
+  if (!t || /\s/.test(t)) return false;
+  if (/^https?:\/\//i.test(t)) return true;
+  if (t.startsWith("localhost")) return true;
+  // host.tld with optional path/port — no spaces already guaranteed
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?(\/.*)?$/i.test(t);
+}
+
+function normalizeUrl(raw: string): string | null {
+  let url = raw.trim();
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 }
 
 export const useSpecter = create<SpecterState>((set, get) => ({
@@ -123,15 +227,13 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   safeSearch: true,
   recencyDays: null,
 
-  viewerOpen: false,
-  viewerSrc: null,
-  viewerUrl: null,
-  viewerStack: [],
-  viewerIndex: -1,
-  viewerLoading: false,
-  viewerGhost: false,
+  tabs: [INITIAL_TAB],
+  activeTabId: INITIAL_TAB.id,
   uvAvailable: false,
-  viewerNonce: 0,
+  dataSaver: true,
+  adBlock: true,
+  readerOn: false,
+  stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0 },
 
   drawerOpen: false,
 
@@ -140,7 +242,7 @@ export const useSpecter = create<SpecterState>((set, get) => ({
   vaultEntries: [],
   vaultKey: null,
 
-  // ── boot: create a fresh encrypted session (RAM-only, never persisted) ──
+  // ── boot: fresh encrypted session (RAM-only) + browser engine ──
   boot: async () => {
     set({ booting: true });
     try {
@@ -158,10 +260,13 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       set({ sessionReady: false, booting: false });
     }
 
-    // Boot the full browser engine (Ultraviolet + bare relay) in the background.
-    // If it is unavailable (no SW support, relay down) fall back to Ghost mode.
+    // Boot the full browser engine (Ultraviolet SW + bare relay).
     const uvReady = await ensureUvEngine();
-    set({ uvAvailable: uvReady, viewerGhost: uvReady ? get().viewerGhost : true });
+    set({ uvAvailable: uvReady });
+    if (uvReady) {
+      const { dataSaver, adBlock } = get();
+      void pushUvSettings({ dataSaver, adBlock });
+    }
   },
 
   setQuery: (q) => set({ query: q }),
@@ -175,7 +280,19 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       return;
     }
 
-    set({ phase: "searching", query, activeQuery: query, searchError: null });
+    set({ phase: "searching", query, activeQuery: query, searchError: null, readerOn: false });
+
+    // route the results into the active tab (browser behavior)
+    const { tabs, activeTabId } = get();
+    if (activeTabId) {
+      const tabs2 = tabs.map((t) =>
+        t.id === activeTabId
+          ? { ...t, kind: "search" as const, query, title: query, url: null, loading: false }
+          : t
+      );
+      set({ tabs: tabs2 });
+    }
+
     const { ok, data } = await securePost<{
       results?: SearchResult[];
       total?: number;
@@ -199,7 +316,6 @@ export const useSpecter = create<SpecterState>((set, get) => ({
         sessionQueryCount: state.sessionQueryCount + 1,
       });
 
-      // record into the encrypted vault if unlocked
       const v = get();
       if (v.vaultUnlocked && v.vaultKey) {
         const entry: VaultEntry = { q: query, ts: Date.now(), count: data.results.length };
@@ -223,7 +339,6 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       return;
     }
 
-    // session may have died (server restart) → re-boot once
     if (!ok && (data as { error?: string } | undefined)?.error !== undefined) {
       set({ phase: "error", searchError: "Secure session lost. Reopen the app to re-establish." });
       return;
@@ -237,164 +352,316 @@ export const useSpecter = create<SpecterState>((set, get) => ({
 
   // ── ghost browser ────────────────────────────────────────────
 
-  openViewer: async (url) => {
-    const { key, sid, viewerGhost } = get();
-    if (!key || !sid) return;
-    let src: string | null;
-    if (viewerGhost || !uvEngineLoaded()) {
-      src = await buildProxySrc(key, sid, url, false, false);
-    } else {
-      src = uvHref(url);
-      if (!src) src = await buildProxySrc(key, sid, url, false, false);
-    }
-    set({
-      viewerOpen: true,
-      viewerSrc: src,
-      viewerUrl: url,
-      viewerStack: [url],
-      viewerIndex: 0,
-      viewerLoading: true,
-    });
+  newTab: (opts) => {
+    const tab = makeTab(opts);
+    set({ tabs: [...get().tabs, tab], activeTabId: tab.id, readerOn: false });
+    return tab.id;
   },
 
-  /** Typed address in the viewer URL bar. */
-  viewerNavigate: async (rawUrl) => {
-    const { key, sid, viewerGhost } = get();
-    if (!key || !sid) return;
-    const trimmed = rawUrl.trim();
-    if (!trimmed) return;
-    let url = trimmed;
-    if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
-    try {
-      // validate — throws on garbage
-      const parsed = new URL(url);
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
-      url = parsed.toString();
-    } catch {
+  closeTab: (id) => {
+    const { tabs, activeTabId } = get();
+    const idx = tabs.findIndex((t) => t.id === id);
+    if (idx === -1) return;
+    const next = tabs.filter((t) => t.id !== id);
+    if (next.length === 0) {
+      const fresh = makeTab();
+      set({ tabs: [fresh], activeTabId: fresh.id, readerOn: false });
       return;
     }
-    let src: string | null;
-    if (viewerGhost || !uvEngineLoaded()) {
-      src = await buildProxySrc(key, sid, url, false, false);
-    } else {
-      src = uvHref(url);
-      if (!src) src = await buildProxySrc(key, sid, url, false, false);
+    let nextActive = activeTabId;
+    if (activeTabId === id) {
+      const neighbor = next[Math.min(idx, next.length - 1)];
+      nextActive = neighbor.id;
     }
-    set({ viewerSrc: src, viewerUrl: url, viewerLoading: true });
-    // push into history stack
-    const { viewerStack, viewerIndex } = get();
-    const stack = [...viewerStack.slice(0, viewerIndex + 1), url];
-    set({ viewerStack: stack, viewerIndex: stack.length - 1 });
+    set({ tabs: next, activeTabId: nextActive, readerOn: false });
   },
 
-  viewerGo: async (delta) => {
-    const { viewerGhost, viewerStack, viewerIndex } = get();
-    const next = viewerIndex + delta;
-    if (next < 0 || next >= viewerStack.length) return;
+  activateTab: (id) => {
+    if (get().activeTabId === id) return;
+    set({ activeTabId: id, readerOn: false });
+  },
 
-    if (!viewerGhost) {
-      // Full browser mode: the proxied frame is same-origin, so native
-      // session history (with full page state) does the navigation.
-      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+  openInBrowser: (url, opts) => {
+    const normalized = normalizeUrl(url);
+    if (!normalized) return;
+    const { tabs, activeTabId } = get();
+    const active = tabs.find((t) => t.id === activeTabId);
+    if (active && active.kind === "newtab" && !opts?.background) {
+      // reuse the empty surface
+      const tabs2 = tabs.map((t) =>
+        t.id === active.id
+          ? {
+              ...t,
+              kind: "web" as const,
+              url: normalized,
+              title: hostOf(normalized),
+              history: [normalized],
+              historyIndex: 0,
+              loading: true,
+              nonce: t.nonce + 1,
+            }
+          : t
+      );
+      set({ tabs: tabs2, readerOn: false });
+      return;
+    }
+    const tab = makeTab({ url: normalized });
+    if (opts?.background) {
+      set({ tabs: [...tabs, tab] });
+    } else {
+      set({ tabs: [...tabs, tab], activeTabId: tab.id, readerOn: false });
+    }
+  },
+
+  omniboxNavigate: async (raw) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    if (looksLikeUrl(trimmed)) {
+      const url = normalizeUrl(trimmed);
+      if (url) await get().tabNavigate(url);
+    } else {
+      await get().search(trimmed);
+    }
+  },
+
+  tabNavigate: async (rawUrl) => {
+    const url = normalizeUrl(rawUrl);
+    if (!url) return;
+    const { tabs, activeTabId } = get();
+    if (!activeTabId) return;
+    const active = tabs.find((t) => t.id === activeTabId);
+    if (!active) return;
+
+    const stack = [...active.history.slice(0, active.historyIndex + 1), url];
+    const tabs2 = tabs.map((t) =>
+      t.id === activeTabId
+        ? {
+            ...t,
+            kind: "web" as const,
+            url,
+            title: hostOf(url),
+            query: null,
+            history: stack,
+            historyIndex: stack.length - 1,
+            loading: true,
+            nonce: t.nonce + 1,
+          }
+        : t
+    );
+    set({ tabs: tabs2, readerOn: false });
+  },
+
+  tabGo: async (delta) => {
+    const { tabs, activeTabId, uvAvailable } = get();
+    if (!activeTabId) return;
+    const active = tabs.find((t) => t.id === activeTabId);
+    if (!active || active.kind !== "web") return;
+    const next = active.historyIndex + delta;
+    if (next < 0 || next >= active.history.length) return;
+    const url = active.history[next];
+
+    if (uvAvailable) {
+      // same-origin frame → native session history (state preserved)
+      const frame = document.getElementById("ghost-frame") as HTMLIFrameElement | null;
       try {
         frame?.contentWindow?.history.go(delta);
-        set({ viewerIndex: next, viewerLoading: true });
+        const tabs2 = tabs.map((t) =>
+          t.id === activeTabId
+            ? { ...t, historyIndex: next, url, loading: true }
+            : t
+        );
+        set({ tabs: tabs2, readerOn: false });
         return;
       } catch {
-        // fall through to stack-based navigation
+        // fall through to stack navigation
       }
     }
 
     const { key, sid } = get();
     if (!key || !sid) return;
-    const url = viewerStack[next];
     const src = await buildProxySrc(key, sid, url, true, false);
-    set({ viewerIndex: next, viewerSrc: src, viewerUrl: url, viewerLoading: true });
+    void src;
+    const tabs2 = tabs.map((t) =>
+      t.id === activeTabId
+        ? { ...t, historyIndex: next, url, loading: true, nonce: t.nonce + 1 }
+        : t
+    );
+    set({ tabs: tabs2, readerOn: false });
   },
 
-  viewerReload: async () => {
-    const { key, sid, viewerUrl, viewerGhost } = get();
-    if (!key || !sid || !viewerUrl) return;
+  tabReload: async () => {
+    const { tabs, activeTabId, uvAvailable } = get();
+    if (!activeTabId) return;
+    const active = tabs.find((t) => t.id === activeTabId);
+    if (!active || active.kind !== "web" || !active.url) return;
 
-    if (!viewerGhost) {
-      // same-origin frame → true in-place reload, session history preserved
-      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+    if (uvAvailable) {
+      const frame = document.getElementById("ghost-frame") as HTMLIFrameElement | null;
       try {
         frame?.contentWindow?.location.reload();
-        set({ viewerLoading: true });
+        const tabs2 = tabs.map((t) =>
+          t.id === activeTabId ? { ...t, loading: true } : t
+        );
+        set({ tabs: tabs2 });
         return;
       } catch {
         // fall through to remount
       }
     }
-    const src = await buildProxySrc(key, sid, viewerUrl, true, false);
-    set({ viewerSrc: src, viewerLoading: true, viewerNonce: get().viewerNonce + 1 });
+    const tabs2 = tabs.map((t) =>
+      t.id === activeTabId ? { ...t, loading: true, nonce: t.nonce + 1 } : t
+    );
+    set({ tabs: tabs2 });
   },
 
-  /** Swap between the full Ghost Browser (Ultraviolet) and the hardened Ghost relay. */
-  toggleViewerMode: async () => {
-    const next = !get().viewerGhost;
-    set({ viewerGhost: next });
-    await get().viewerReload();
-  },
-
-  /** Called on iframe load: reconciles the real location with our history stack. */
-  viewerLoaded: async () => {
-    const { viewerGhost, viewerStack, viewerIndex, viewerUrl } = get();
-    set({ viewerLoading: false });
+  tabLoaded: async () => {
+    const { tabs, activeTabId } = get();
+    if (!activeTabId) return;
+    set({
+      tabs: tabs.map((t) => (t.id === activeTabId ? { ...t, loading: false } : t)),
+    });
     try {
-      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+      const frame = document.getElementById("ghost-frame") as HTMLIFrameElement | null;
       const href = frame?.contentWindow?.location.href;
       if (!href) return;
-
+      const { uvAvailable, key } = get();
       let realUrl: string | null = null;
-      if (!viewerGhost) {
+      if (uvAvailable) {
         realUrl = uvRealUrl(href);
-      } else {
-        const { key } = get();
-        if (key) realUrl = await unsealProxyLocation(key, href);
+      } else if (key) {
+        realUrl = await unsealProxyLocation(key, href);
       }
-      if (!realUrl || realUrl === viewerUrl) return;
-      // user navigated inside the viewer via the proxy → push history
-      if (viewerStack[viewerIndex] === realUrl) return;
-      const stack = [...viewerStack.slice(0, viewerIndex + 1), realUrl];
-      set({ viewerStack: stack, viewerIndex: stack.length - 1, viewerUrl: realUrl });
+      if (!realUrl) return;
+      get().handlePageMessage({ type: "page", href });
     } catch {
-      // cross-origin access — ignore
+      // cross-origin — ignore
     }
   },
 
-  /**
-   * Poll hook (full browser mode): sites navigate with pushState inside the
-   * frame, which never fires an iframe load event — reconcile the address
-   * bar and history stack by reading the frame location.
-   */
-  viewerSync: () => {
-    const { viewerOpen, viewerGhost, viewerStack, viewerIndex, viewerUrl } = get();
-    if (!viewerOpen || viewerGhost) return;
+  tabSync: () => {
+    const { tabs, activeTabId, uvAvailable } = get();
+    if (!activeTabId || !uvAvailable) return;
+    const active = tabs.find((t) => t.id === activeTabId);
+    if (!active || active.kind !== "web") return;
     try {
-      const frame = document.getElementById("specter-viewer-frame") as HTMLIFrameElement | null;
+      const frame = document.getElementById("ghost-frame") as HTMLIFrameElement | null;
       const href = frame?.contentWindow?.location.href;
       if (!href) return;
       const real = uvRealUrl(href);
-      if (!real || real === viewerUrl) return;
-      // moving through existing stack entries (back/forward) vs a new page
-      if (viewerIndex > 0 && viewerStack[viewerIndex - 1] === real) {
-        set({ viewerIndex: viewerIndex - 1, viewerUrl: real });
-        return;
-      }
-      if (viewerIndex >= 0 && viewerIndex < viewerStack.length - 1 && viewerStack[viewerIndex + 1] === real) {
-        set({ viewerIndex: viewerIndex + 1, viewerUrl: real });
-        return;
-      }
-      const stack = [...viewerStack.slice(0, viewerIndex + 1), real];
-      set({ viewerStack: stack, viewerIndex: stack.length - 1, viewerUrl: real });
+      if (!real || real === active.url) return;
+      get().handlePageMessage({ type: "page", href });
     } catch {
-      // frame not ready / cross-origin — ignore
+      // frame not ready — ignore
     }
   },
 
-  closeViewer: () => set({ viewerOpen: false, viewerSrc: null, viewerUrl: null, viewerStack: [], viewerIndex: -1 }),
+  /** Messages from specter-client.js inside proxied pages. */
+  handlePageMessage: (data) => {
+    const type = data.type as string | undefined;
+    const { tabs, activeTabId } = get();
+    if (!activeTabId) return;
+    const active = tabs.find((t) => t.id === activeTabId);
+    if (!active || active.kind !== "web") return;
+
+    if (type === "page" && typeof data.href === "string") {
+      const real = uvRealUrl(data.href) ?? data.href;
+      const title = typeof data.title === "string" && data.title ? data.title : hostOf(real);
+
+      // unchanged?
+      if (real === active.url && title === active.title) return;
+
+      // back/forward inside the frame?
+      if (active.history[active.historyIndex - 1] === real) {
+        set({
+          tabs: tabs.map((t) =>
+            t.id === activeTabId
+              ? { ...t, url: real, title, historyIndex: t.historyIndex - 1, loading: false }
+              : t
+          ),
+        });
+        return;
+      }
+      if (active.history[active.historyIndex + 1] === real) {
+        set({
+          tabs: tabs.map((t) =>
+            t.id === activeTabId
+              ? { ...t, url: real, title, historyIndex: t.historyIndex + 1, loading: false }
+              : t
+          ),
+        });
+        return;
+      }
+
+      // fresh navigation → push onto the stack
+      if (real !== active.url) {
+        const history = [...active.history.slice(0, active.historyIndex + 1), real];
+        set({
+          tabs: tabs.map((t) =>
+            t.id === activeTabId
+              ? { ...t, url: real, title, history, historyIndex: history.length - 1, loading: false }
+              : t
+          ),
+        });
+        return;
+      }
+
+      // same URL, just a title update
+      set({
+        tabs: tabs.map((t) => (t.id === activeTabId ? { ...t, title, loading: false } : t)),
+      });
+      return;
+    }
+
+    if (type === "popup" && typeof data.href === "string") {
+      get().openInBrowser(data.href);
+      return;
+    }
+
+    if (type === "video-deferred") {
+      get().addStats({ videosDeferred: 1 });
+    }
+  },
+
+  toggleReader: () => set({ readerOn: !get().readerOn }),
+
+  setDataSaver: (v) => {
+    set({ dataSaver: v });
+    const { adBlock, uvAvailable } = get();
+    void pushUvSettings({ dataSaver: v, adBlock });
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem("specter:settings", JSON.stringify({ dataSaver: v, adBlock }));
+      } catch {
+        /* ignore */
+      }
+    }
+    void uvAvailable;
+  },
+
+  setAdBlock: (v) => {
+    set({ adBlock: v });
+    const { dataSaver } = get();
+    void pushUvSettings({ dataSaver, adBlock: v });
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem("specter:settings", JSON.stringify({ dataSaver, adBlock: v }));
+      } catch {
+        /* ignore */
+      }
+    }
+  },
+
+  addStats: (delta) => {
+    const s = get().stats;
+    set({
+      stats: {
+        blocked: s.blocked + (delta.blocked ?? 0),
+        imagesCompressed: s.imagesCompressed + (delta.imagesCompressed ?? 0),
+        bytesSaved: s.bytesSaved + (delta.bytesSaved ?? 0),
+        videosDeferred: s.videosDeferred + (delta.videosDeferred ?? 0),
+      },
+    });
+  },
 
   setDrawerOpen: (v) => set({ drawerOpen: v }),
 
@@ -437,9 +704,20 @@ export const useSpecter = create<SpecterState>((set, get) => ({
         });
       }
     } catch {
-      // ignore — best effort
+      // best effort
     }
     vaultWipe();
+    const fresh: BrowserTab = {
+      id: freshTabId(),
+      kind: "newtab",
+      title: "New Tab",
+      url: null,
+      query: null,
+      history: [],
+      historyIndex: -1,
+      loading: false,
+      nonce: 0,
+    };
     set({
       sid: null,
       key: null,
@@ -453,12 +731,10 @@ export const useSpecter = create<SpecterState>((set, get) => ({
       tookMs: 0,
       filteredCount: 0,
       searchError: null,
-      viewerOpen: false,
-      viewerSrc: null,
-      viewerUrl: null,
-      viewerStack: [],
-      viewerIndex: -1,
-      viewerGhost: get().uvAvailable ? false : true,
+      tabs: [fresh],
+      activeTabId: fresh.id,
+      readerOn: false,
+      stats: { blocked: 0, imagesCompressed: 0, bytesSaved: 0, videosDeferred: 0 },
       drawerOpen: false,
       vaultExists: false,
       vaultUnlocked: false,
@@ -480,7 +756,15 @@ async function unlockInternal(pass: string) {
   return result;
 }
 
-// hydrate vault existence on first client load
+// hydrate: vault existence + settings mirror for injected pages
 if (typeof window !== "undefined") {
   useSpecter.setState({ vaultExists: vaultExists() });
+  try {
+    const { dataSaver, adBlock } = useSpecter.getState();
+    window.localStorage.setItem("specter:settings", JSON.stringify({ dataSaver, adBlock }));
+  } catch {
+    /* ignore */
+  }
 }
+
+export { shortSessionId };

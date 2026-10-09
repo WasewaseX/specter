@@ -1,30 +1,59 @@
 "use client";
 
 /**
- * SPECTER — Zero-Trace Encrypted Search Engine.
- * Single-surface app: search hero / results, ghost viewer overlay, privacy drawer.
+ * SPECTER — Zero-Trace Search Engine + Ghost Browser.
+ * Browser chrome: header / tab strip / navigation bar / tab surface / status.
+ * Everything between the omnibox and the status bar is the active tab.
  */
 
 import { useEffect } from "react";
 import { useSpecter } from "@/store/specter";
+import { subscribeUvMessages } from "@/lib/uv-browser";
 import Header from "@/components/specter/header";
-import SearchHero from "@/components/specter/search-hero";
-import ResultsView from "@/components/specter/results-view";
+import TabStrip from "@/components/specter/tab-strip";
+import BrowserBar from "@/components/specter/browser-bar";
+import GhostBrowser from "@/components/specter/ghost-browser";
 import Footer from "@/components/specter/footer";
-import ViewerOverlay from "@/components/specter/viewer-overlay";
 import PrivacyDrawer from "@/components/specter/privacy-drawer";
 
 export default function Home() {
   const boot = useSpecter((s) => s.boot);
-  const phase = useSpecter((s) => s.phase);
-  const activeQuery = useSpecter((s) => s.activeQuery);
   const drawerOpen = useSpecter((s) => s.drawerOpen);
+  const tabs = useSpecter((s) => s.tabs);
+  const activeTabId = useSpecter((s) => s.activeTabId);
+  const handlePageMessage = useSpecter((s) => s.handlePageMessage);
+  const addStats = useSpecter((s) => s.addStats);
 
   useEffect(() => {
     void boot();
   }, [boot]);
 
-  // "/" focuses the search field from anywhere (when no overlay is up)
+  // messages from the engine SW: blocked trackers + compression stats
+  useEffect(() => {
+    const unsubscribe = subscribeUvMessages((data) => {
+      if (data.type === "specter:blocked") {
+        addStats({ blocked: 1 });
+      } else if (data.type === "specter:img") {
+        const saved = Number(data.saved) || 0;
+        addStats({ imagesCompressed: 1, bytesSaved: saved });
+      }
+    });
+    return unsubscribe;
+  }, [addStats]);
+
+  // messages from injected page hooks: address-bar sync + popup → tab
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as Record<string, unknown> | null;
+      if (!data || typeof data !== "object" || data.__specter !== true) return;
+      if (event.source === window) return;
+      handlePageMessage(data);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [handlePageMessage]);
+
+  // "/" focuses the search field from anywhere
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -43,10 +72,28 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const showResults = phase !== "idle" || activeQuery.length > 0;
+  // Ctrl/Cmd+T new tab, Ctrl/Cmd+W close tab (browser feel)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const store = useSpecter.getState();
+      if (e.key === "t" || e.key === "T") {
+        e.preventDefault();
+        store.newTab();
+      } else if (e.key === "w" || e.key === "W") {
+        e.preventDefault();
+        if (store.activeTabId) store.closeTab(store.activeTabId);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const activeTab = tabs.find((t) => t.id === activeTabId);
+  const showBrowserBar = activeTab?.kind === "web";
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-zinc-950">
+    <div className="relative flex h-[100dvh] flex-col overflow-hidden bg-zinc-950">
       {/* ambient security-grid backdrop */}
       <div
         aria-hidden
@@ -60,21 +107,17 @@ export default function Home() {
             "radial-gradient(ellipse 80% 60% at 50% 0%, black 30%, transparent 100%)",
         }}
       />
-      {/* top glow */}
-      <div
-        aria-hidden
-        className="pointer-events-none fixed left-1/2 top-[-320px] z-0 h-[560px] w-[900px] -translate-x-1/2 rounded-full bg-emerald-500/10 blur-[140px]"
-      />
 
       <Header />
+      <TabStrip />
+      {showBrowserBar ? <BrowserBar /> : null}
 
-      <main className="relative z-10 flex w-full flex-1 flex-col">
-        {showResults ? <ResultsView /> : <SearchHero />}
+      <main className="relative z-10 flex min-h-0 w-full flex-1 flex-col">
+        <GhostBrowser />
       </main>
 
       <Footer />
 
-      <ViewerOverlay />
       {drawerOpen && <PrivacyDrawer />}
     </div>
   );

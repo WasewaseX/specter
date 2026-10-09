@@ -57,13 +57,14 @@ export default function ResultsView() {
   const filteredCount = useSpecter((s) => s.filteredCount);
   const searchError = useSpecter((s) => s.searchError);
   const safeSearch = useSpecter((s) => s.safeSearch);
-  const openViewer = useSpecter((s) => s.openViewer);
+  const openInBrowser = useSpecter((s) => s.openInBrowser);
+  const omniboxNavigate = useSpecter((s) => s.omniboxNavigate);
 
   if (phase === "idle" && activeQuery.length === 0) return null;
 
   function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    void search();
+    void omniboxNavigate(query);
   }
 
   return (
@@ -139,7 +140,7 @@ export default function ResultsView() {
                 result={result}
                 index={index}
                 onOpen={(url) => {
-                  void openViewer(url);
+                  openInBrowser(url);
                 }}
               />
             ))}
@@ -180,7 +181,7 @@ function ResultRow({
         <button
           type="button"
           onClick={() => onOpen(result.url)}
-          aria-label={`Open ${host} in encrypted viewer: ${result.title}`}
+          aria-label={`Open ${host} in the encrypted browser: ${result.title}`}
           className="line-clamp-2 text-left font-medium leading-snug text-zinc-100 transition-colors hover:text-emerald-300"
         >
           {result.title}
@@ -202,7 +203,7 @@ function ResultRow({
           <button
             type="button"
             onClick={() => onOpen(result.url)}
-            aria-label={`Open ${host} in the Ghost Browser`}
+            aria-label={`Open ${host} in a new encrypted browser tab`}
             className="inline-flex items-center gap-1 text-xs text-zinc-400 transition-colors hover:text-emerald-300"
           >
             <Globe className="h-3.5 w-3.5" aria-hidden="true" />
@@ -213,7 +214,7 @@ function ResultRow({
             href={result.url}
             target="_blank"
             rel="noopener noreferrer nofollow"
-            aria-label={`Open ${host} outside the viewer`}
+            aria-label={`Open ${host} outside the encrypted browser`}
             className="inline-flex items-center gap-1 text-xs text-zinc-500 transition-colors hover:text-zinc-300"
           >
             <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />

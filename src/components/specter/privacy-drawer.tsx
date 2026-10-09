@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { Flame, ShieldCheck, X } from "lucide-react";
+import { Flame, ShieldCheck, X, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -72,6 +72,11 @@ export default function PrivacyDrawer() {
   const setSafeSearch = useSpecter((s) => s.setSafeSearch);
   const recencyDays = useSpecter((s) => s.recencyDays);
   const setRecencyDays = useSpecter((s) => s.setRecencyDays);
+  const dataSaver = useSpecter((s) => s.dataSaver);
+  const setDataSaver = useSpecter((s) => s.setDataSaver);
+  const adBlock = useSpecter((s) => s.adBlock);
+  const setAdBlock = useSpecter((s) => s.setAdBlock);
+  const stats = useSpecter((s) => s.stats);
   const panicWipe = useSpecter((s) => s.panicWipe);
   const { toast } = useToast();
 
@@ -237,11 +242,41 @@ export default function PrivacyDrawer() {
                 </Select>
               </div>
 
+              <div className="flex items-center justify-between gap-4 border-b border-zinc-800/50 py-3">
+                <div className="min-w-0">
+                  <p className="text-xs text-zinc-200">Ad &amp; tracker firewall</p>
+                  <p className="text-[11px] text-zinc-500">
+                    Engine-level blocking — pages never load tracking junk
+                  </p>
+                </div>
+                <Switch
+                  checked={adBlock}
+                  onCheckedChange={setAdBlock}
+                  aria-label="Toggle ad and tracker firewall"
+                  className="data-[state=checked]:bg-emerald-400"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4 border-b border-zinc-800/50 py-3">
+                <div className="min-w-0">
+                  <p className="text-xs text-zinc-200">Data Saver</p>
+                  <p className="text-[11px] text-zinc-500">
+                    Images recompressed server-side · videos wait for your tap
+                  </p>
+                </div>
+                <Switch
+                  checked={dataSaver}
+                  onCheckedChange={setDataSaver}
+                  aria-label="Toggle data saver"
+                  className="data-[state=checked]:bg-emerald-400"
+                />
+              </div>
+
               <div className="flex items-center justify-between gap-4 py-3">
                 <div className="min-w-0">
-                  <p className="text-xs text-zinc-200">Tracker stripping</p>
+                  <p className="text-xs text-zinc-200">RAM-only engine</p>
                   <p className="text-[11px] text-zinc-500">
-                    All scripts removed in Ghost Viewer
+                    Tabs, history and stats live in memory only
                   </p>
                 </div>
                 <Badge
@@ -251,6 +286,35 @@ export default function PrivacyDrawer() {
                   ALWAYS ON
                 </Badge>
               </div>
+            </div>
+          </section>
+
+          {/* ── live session stats ─────────────────────── */}
+          <section>
+            <SectionHeading>LIVE SESSION STATS</SectionHeading>
+            <div className="mt-1">
+              <DefRow label="Trackers blocked">
+                <span className="inline-flex items-center gap-1.5 text-emerald-300">
+                  <ShieldCheck className="size-3" aria-hidden="true" />
+                  {stats.blocked}
+                </span>
+              </DefRow>
+              <DefRow label="Images recompressed">
+                <span className="text-zinc-300">{stats.imagesCompressed}</span>
+              </DefRow>
+              <DefRow label="Bandwidth saved">
+                <span className="inline-flex items-center gap-1.5 text-emerald-300">
+                  <Zap className="size-3" aria-hidden="true" />
+                  {stats.bytesSaved < 1024
+                    ? `${stats.bytesSaved} B`
+                    : stats.bytesSaved < 1024 * 1024
+                      ? `${(stats.bytesSaved / 1024).toFixed(1)} KB`
+                      : `${(stats.bytesSaved / (1024 * 1024)).toFixed(1)} MB`}
+                </span>
+              </DefRow>
+              <DefRow label="Videos deferred to tap">
+                <span className="text-zinc-300">{stats.videosDeferred}</span>
+              </DefRow>
             </div>
           </section>
 

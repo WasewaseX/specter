@@ -146,3 +146,35 @@ export function uvRealUrl(locationHref: string): string | null {
     return null;
   }
 }
+
+/**
+ * Push browsing settings into the Ultraviolet service worker (RAM only).
+ * The SW uses these for tracker blocking and data-saver image compression.
+ */
+export async function pushUvSettings(settings: { dataSaver: boolean; adBlock: boolean }): Promise<void> {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration("/service/");
+    reg?.active?.postMessage({ type: "specter:settings", ...settings });
+  } catch {
+    /* engine not ready — settings are re-pushed after boot */
+  }
+}
+
+/**
+ * Subscribe to messages from the engine (blocked trackers, compression
+ * stats). Returns an unsubscribe function.
+ */
+export function subscribeUvMessages(cb: (data: Record<string, unknown>) => void): () => void {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
+    return () => undefined;
+  }
+  const listener = (event: MessageEvent) => {
+    const data = event.data as Record<string, unknown> | null;
+    if (data && typeof data === "object" && typeof data.type === "string" && data.type.startsWith("specter:")) {
+      cb(data);
+    }
+  };
+  navigator.serviceWorker.addEventListener("message", listener);
+  return () => navigator.serviceWorker.removeEventListener("message", listener);
+}

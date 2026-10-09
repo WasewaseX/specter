@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 import { open as openEnvelope, seal } from "@/lib/crypto";
 import { getSession, rateLimit } from "@/lib/session-store";
+import { upstreamFetch } from "@/lib/upstream-fetch";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -118,18 +119,20 @@ export async function GET(req: NextRequest) {
 
   let upstream: Response;
   try {
-    upstream = await fetch(parsed.toString(), {
-      redirect: "follow",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    // HTTP/2-capable upstream fetch (h1.1 is 403-blocked by Wikipedia/Wikimedia/Reddit)
+    const result = await upstreamFetch(parsed.toString(), {
+      timeoutMs: FETCH_TIMEOUT_MS,
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         DNT: "1",
         "Sec-GPC": "1",
         "Upgrade-Insecure-Requests": "1",
       },
+    });
+    upstream = new Response(new Uint8Array(result.body), {
+      status: result.status,
+      headers: { "content-type": result.contentType },
     });
   } catch {
     return new NextResponse(
@@ -192,7 +195,7 @@ export async function GET(req: NextRequest) {
       headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
     });
   }
-  return new NextResponse(buf, {
+  return new NextResponse(new Uint8Array(buf), {
     status: upstream.status,
     headers: { ...baseHeaders, "Content-Type": contentType },
   });
