@@ -778,7 +778,7 @@ export default function PrivacyDrawer() {
                   ["works", "video pipeline", "Range streaming, seek, no amplification"],
                   ["works", "repeat visits", "public images/fonts/css/js served from the RAM cache"],
                   ["works", "search + downloads", "encrypted search, built-in downloader"],
-                  ["mixed", "YouTube", "browse/search/watch pages OK · playback walled by YouTube's anti-bot policy on datacenter IPs"],
+                  ["mixed", "YouTube", "browse/search/watch pages OK · playback walled by YouTube's anti-bot policy on datacenter IPs (embedded player can also be refused — Error 153)"],
                   ["upstream", "YouTube sign-in", "Google refuses sign-ins from relayed browsers ('may not be secure') — honest notice shown in-page"],
                   ["mixed", "DuckDuckGo", "serves bot-walls to datacenter IPs"],
                   ["upstream", "X / Twitter", "X's own anti-bot JS refuses any proxy"],

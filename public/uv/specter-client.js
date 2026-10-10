@@ -10,6 +10,10 @@
  *  2. Popup → tab — target="_blank" links and window.open become new tabs
  *     in the Specter chrome instead of stray top-level windows.
  *  3. Privacy — navigator.sendBeacon is neutralised (pure tracking).
+ *  3b. Pipeline integrity — root-relative fetch/XHR URLs fired by page JS
+ *     (e.g. Google sign-in telemetry) are resolved against the REAL page
+ *     URL and routed through the engine, instead of escaping the narrow
+ *     /service/ SW scope and 404-ing on the app origin.
  *  4. Data Saver (OPT-IN, off by default) — when enabled in the privacy
  *     drawer, plain <video>/<audio> elements never preload or autoplay:
  *     nothing is downloaded until you press play. Playback itself streams
@@ -157,6 +161,122 @@
   try {
     navigator.sendBeacon = function () {
       return true;
+    };
+  } catch (e) {
+    /* ignore */
+  }
+
+  /* ── 3b. escaped runtime requests stay inside the engine ──────
+   * The service worker is registered with the narrow /service/ scope, so
+   * a root-relative request fired by page JS (fetch/XHR — observed live
+   * with Google sign-in telemetry: POST /v3/signin/_/AccountsSignInUi/
+   * web-reports → 404 on the app origin) resolves against OUR origin,
+   * never enters the SW, and dies on Next.js. Fix at the source: rewrite
+   * root-relative fetch/XHR URLs against the REAL page URL and route
+   * them through the engine like any other proxied request.
+   * Beacons stay dead (3); this only rescues requests that carry real
+   * page data. App paths (/service/, /api/, /uv/, /bare/, /_next/) and
+   * foreign absolute URLs are left exactly as they were. */
+  var APP_PREFIXES = ["/api/", "/uv/", "/bare/", "/_next/"];
+  function uvPrefix() {
+    try {
+      if (window.__uv$config && window.__uv$config.prefix) return window.__uv$config.prefix;
+    } catch (e) {
+      /* default holds */
+    }
+    return "/service/";
+  }
+  function isAppPath(pathname) {
+    if (pathname === "/" || pathname === "/favicon.ico") return true;
+    if (pathname.indexOf(uvPrefix()) === 0) return true;
+    for (var i = 0; i < APP_PREFIXES.length; i++) {
+      if (pathname.indexOf(APP_PREFIXES[i]) === 0) return true;
+    }
+    return false;
+  }
+  /* The REAL base URL of this document (proxied path decoded), inherited
+   * from the top window inside same-origin frames where the hook cannot
+   * decode its own location (about:blank-style hidden iframes). */
+  function realBase() {
+    try {
+      var u = realLocation();
+      if (u && u.origin !== window.location.origin) return u;
+    } catch (e) {
+      /* fall through to the parent */
+    }
+    try {
+      if (window.parent && window.parent !== window && window.parent.__specterRealUrl) {
+        var p = new URL(window.parent.__specterRealUrl);
+        if (/^https?:/.test(p.protocol)) return p;
+      }
+    } catch (e) {
+      /* cross-origin parent or missing — give up honestly */
+    }
+    return null;
+  }
+  try {
+    var selfReal = realLocation();
+    if (selfReal && selfReal.origin !== window.location.origin) {
+      window.__specterRealUrl = selfReal.href;
+    }
+  } catch (e) {
+    /* ignore */
+  }
+  /* Returns a rewritten engine URL for an escaped request, or null when
+   * the request is fine as-is (foreign absolute / app path / no base). */
+  function escapeCheck(raw) {
+    try {
+      if (raw === null || raw === undefined || raw === "") return null;
+      var u = new URL(String(raw), window.location.href);
+      if (u.origin !== window.location.origin) return null;
+      if (isAppPath(u.pathname)) return null;
+      var base = realBase();
+      if (!base) return null;
+      var target = new URL(String(raw), base);
+      return uvPrefix() + encodeURIComponent(target.href);
+    } catch (e) {
+      return null;
+    }
+  }
+  try {
+    var nativeFetch = window.fetch;
+    if (typeof nativeFetch === "function") {
+      window.fetch = function (input, init) {
+        try {
+          if (input && typeof input === "object" && input.url) {
+            var rewrittenReq = escapeCheck(input.url);
+            if (rewrittenReq) {
+              return nativeFetch.call(
+                window,
+                new Request(rewrittenReq, init !== undefined ? init : input)
+              );
+            }
+          } else {
+            var rewritten = escapeCheck(input);
+            if (rewritten) return nativeFetch.call(window, rewritten, init);
+          }
+        } catch (e) {
+          /* fall through to native behaviour */
+        }
+        return nativeFetch.apply(window, arguments);
+      };
+    }
+  } catch (e) {
+    /* ignore */
+  }
+  try {
+    var nativeXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      try {
+        var rewrittenXhr = escapeCheck(url);
+        if (rewrittenXhr) {
+          var rest = Array.prototype.slice.call(arguments, 2);
+          return nativeXhrOpen.apply(this, [method, rewrittenXhr].concat(rest));
+        }
+      } catch (e) {
+        /* fall through to native behaviour */
+      }
+      return nativeXhrOpen.apply(this, arguments);
     };
   } catch (e) {
     /* ignore */
@@ -310,7 +430,8 @@
       text.innerHTML =
         "<b style='color:#6ee7b7'>Playback blocked by YouTube</b><br>" +
         "<span style='color:#9ca3af;font-size:12px'>This network's IP is flagged by YouTube's anti-bot wall (sign-in required). " +
-        "Try the embedded player, sign in through SPECTER, or watch from a residential network — everything else on this page works.</span>";
+        "Playback needs a residential network or sign-in — on datacenter relays the embedded player can also be refused (Error 153). " +
+        "Everything else on this page works.</span>";
       text.style.cssText = "color:#e5e7eb;max-width:60vw";
       var btn = document.createElement("button");
       btn.textContent = "▶ Play";

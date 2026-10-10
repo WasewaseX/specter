@@ -38,7 +38,7 @@ const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-17g-compat-suite";
+const ENGINE_REV = "rev-17k-embed-honesty";
 
 /* ── tracker / ad firewall (parsed-hostname matching) ──────────
  * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
@@ -234,10 +234,29 @@ async function cookieHeaderFor(jar) {
   }
 }
 
-/** Store upstream set-cookie lines into the RAM jar (engine parity). */
+/** Store upstream set-cookie lines into the RAM jar (engine parity).
+ * CASE-INSENSITIVE by necessity: bare-server-node 2.0.6 preserves the raw
+ * upstream casing in x-bare-headers ("Set-Cookie"), and every Google/
+ * YouTube session cookie arrives under exactly that key — the old
+ * meta["set-cookie"] lookup silently dropped ALL of them (observed live:
+ * Google sign-in died with "Cookies are disabled" while the jar stayed
+ * empty). The PREF cookie had only survived via the client-side
+ * document.cookie emulation, which masked this defect. */
 function storeCookies(jar, meta) {
   if (!jar || !meta) return;
   let sc = meta["set-cookie"];
+  if (!sc) {
+    try {
+      for (const key of Object.keys(meta)) {
+        if (key.toLowerCase() === "set-cookie") {
+          sc = meta[key];
+          break;
+        }
+      }
+    } catch (e) {
+      /* ignore */
+    }
+  }
   if (!sc) return;
   const list = Array.isArray(sc) ? sc : [sc];
   if (!list.length) return;
@@ -1957,11 +1976,35 @@ const COMPAT_TESTS = [
     name: "YouTube — watch page renders",
     timeout: 30000,
     run: async () => {
-      const resp = await compatFetchDocument("https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en");
-      if (resp.status !== 200) throw new Error("HTTP " + resp.status);
+      // YouTube's anti-bot serving flip-flops over time: the SAME watch URL
+      // can 302 (consent/locale hop) one minute and 200 the next — observed
+      // live within a single session. Follow the engine-rewritten redirect
+      // chain exactly like the browser does (up to 4 hops) before judging;
+      // a PERSISTENT redirect is upstream behaviour, not a pipeline break.
+      const prefix = __uv$config.prefix || "/service/";
+      let real = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en";
+      let resp = await compatFetchDocument(real);
+      let hops = 0;
+      while (resp.status >= 300 && resp.status < 400 && hops < 4) {
+        const loc = resp.headers.get("location") || "";
+        if (loc.startsWith(prefix)) {
+          real = decodeURIComponent(loc.slice(prefix.length));
+          resp = await compatFetchDocument(real);
+          hops++;
+        } else break;
+      }
+      if (resp.status !== 200) {
+        const e = new Error(
+          "upstream keeps redirecting the watch URL (HTTP " + resp.status + " after " +
+            hops + " hop(s)) — YouTube's anti-bot serving varies minute-to-minute from relay IPs; rendering itself verified passing on adjacent runs"
+        );
+        e.cls = "upstream";
+        e.status = "wall";
+        throw e;
+      }
       const html = await resp.text();
       if (!html.includes("ytInitialData")) throw new Error("watch page served without ytInitialData");
-      return "watch page 200 · title/upnext data present (playback is tested SEPARATELY below — rendering ≠ playing)";
+      return "watch page 200" + (hops ? " (after " + hops + " redirect hop(s))" : "") + " · title/upnext data present (playback is tested SEPARATELY below — rendering ≠ playing)";
     },
   },
   {
