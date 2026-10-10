@@ -89,6 +89,34 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
     );
   }
 
+  // TEMP DIAGNOSTIC (dev console only, never persisted): who reaches the
+  // server-side fallback for a request the SW was expected to guard? Media
+  // destinations are excluded — <video>/<audio> bypass the SW by spec.
+  {
+    const dest = (req.headers.get("sec-fetch-dest") || "").toLowerCase();
+    if (
+      process.env.NODE_ENV !== "production" &&
+      !["video", "audio", "media"].includes(dest)
+    ) {
+      console.log(
+        `[service-fallback] ${req.method} ${target.host}${target.pathname.slice(0, 60)} referer=${req.headers.get("referer") ?? "-"} dest=${dest || "-"} mode=${req.headers.get("sec-fetch-mode") ?? "-"}`
+      );
+    }
+  }
+
+  // Ultraviolet splices the page-hook <script src="/uv/specter-client.js">
+  // into HTML BEFORE URL-rewriting, so in some rewrite orders its src comes
+  // back as a SITE-absolute URL (e.g. https://github.com/uv/specter-client.js).
+  // The service worker guards those requests (sw.js) and serves our local
+  // asset; when one slips past it to this server-side fallback, fetching it
+  // "upstream" is nonsense (the path only exists on our origin) and 404s.
+  // Serve the engine asset straight from our own /uv/ folder instead — same
+  // bytes the SW would have returned. Same for the other engine scripts.
+  const ENGINE_ASSET = /^\/uv\/(specter-client|uv\.client|uv\.handler|uv\.bundle|uv\.config|uv\.sw)\.(js|css)$/i;
+  if (ENGINE_ASSET.test(target.pathname)) {
+    return NextResponse.redirect(new URL(target.pathname, req.nextUrl.origin), 307);
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {

@@ -38,7 +38,7 @@ const SETTINGS = { dataSaver: false, adBlock: true, bypassHosts: [] };
 /* ENGINE_REV: bump whenever behaviour changes. The app calls
  * registration.update() on boot and the browser byte-compares sw.js, so this
  * guarantees users never stay stranded on a stale (broken) worker. */
-const ENGINE_REV = "rev-17k-embed-honesty";
+const ENGINE_REV = "rev-17l-asset-guard";
 
 /* ── tracker / ad firewall (parsed-hostname matching) ──────────
  * Rules match the PARSED hostname — dot-boundary suffix or exact — never a
@@ -1860,6 +1860,9 @@ const COMPAT_TESTS = [
       while ((m = re.exec(html)) && srcs.length < 4) {
         const u = m[1];
         if (/\.svg(\?|$)|1x1|pixel|sprite|blank\.gif/i.test(u)) continue;
+        // engine-owned paths (our injected hook can appear site-absolute in
+        // rewritten HTML) are not site assets — testing them proves nothing
+        if (/\/uv\//i.test(u)) continue;
         srcs.push(u);
       }
       if (!srcs.length) throw new Error("no image URLs found in the loaded document");
@@ -1919,7 +1922,11 @@ const COMPAT_TESTS = [
       const re = /<script\b[^>]+src="(https?:\/\/[^"']+)"/gi;
       const candidates = [];
       let m;
-      while ((m = re.exec(html)) && candidates.length < 4) candidates.push(m[1]);
+      while ((m = re.exec(html)) && candidates.length < 4) {
+        // skip our own injected page hook — it is engine-owned, not a site asset
+        if (/\/uv\//i.test(m[1])) continue;
+        candidates.push(m[1]);
+      }
       if (!candidates.length)
         return { status: "pass", cls: "code", detail: "no external script URLs found this run (inline scripts only — pass by default)" };
       const errs = [];
