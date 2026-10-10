@@ -18,6 +18,8 @@ export interface UpstreamResult {
   contentType: string;
   body: Buffer;
   finalUrl: string;
+  /** Present on 429-style rate-limit responses (e.g. Wikimedia Varnish). */
+  retryAfter?: string;
 }
 
 const H2_REQUIRED = [
@@ -115,6 +117,7 @@ async function h2Fetch(
     let status = 0;
     let contentType = "application/octet-stream";
     let contentEncoding: string | undefined;
+    let retryAfter: string | undefined;
     const chunks: Buffer[] = [];
     let total = 0;
 
@@ -122,6 +125,7 @@ async function h2Fetch(
       status = Number(rh[":status"] ?? 0);
       contentType = String(rh["content-type"] ?? "application/octet-stream");
       contentEncoding = rh["content-encoding"] ? String(rh["content-encoding"]) : undefined;
+      retryAfter = rh["retry-after"] ? String(rh["retry-after"]) : undefined;
     });
 
     req.on("data", (chunk: Buffer) => {
@@ -140,7 +144,7 @@ async function h2Fetch(
     req.on("end", () => {
       const raw = Buffer.concat(chunks);
       const body = decompress(raw, contentEncoding);
-      finish(() => resolve({ status, contentType, body, finalUrl: target.toString() }));
+      finish(() => resolve({ status, contentType, body, finalUrl: target.toString(), retryAfter }));
     });
 
     req.end();
@@ -179,6 +183,7 @@ async function attemptFetch(
       contentType: res.headers.get("content-type") ?? "application/octet-stream",
       body: buf,
       finalUrl: res.url || target.toString(),
+      retryAfter: res.headers.get("retry-after") ?? undefined,
     };
   } finally {
     clearTimeout(timer);

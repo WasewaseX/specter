@@ -295,3 +295,8 @@ Work Log:
 Stage Summary:
 - The last unexplained pipeline 404 is dead: engine assets can no longer leak to upstream fetches through ANY path (SW guard + server-fallback guard), and the suite no longer tests its own engine plumbing as if it were site content.
 - All rev-17k baselines re-proven on rev-17l with fresh evidence, including on a relay restarted mid-run; zero code/network failures anywhere.
+
+Task 15 addendum — img output cache (rate-limit spiral fix):
+- E2E extension pass exposed a REAL Data-Saver defect: with saver ON, every /api/img request re-fetched upstream — on image-heavy sites this spirals into upstream rate limits (observed LIVE: Wikimedia Varnish 429 retry-after=600 on upload.wikimedia.org after repeated article loads; curl + node H2 probe both 429). Each SW reroute that 502'd also paid a wasted bare-relay rescue fetch, hammering the host twice per image per reload.
+- FIX (src/app/api/img/route.ts): bounded RAM LRU output cache — successful outputs (recompressed WebP or passthrough bytes) up to 3MB/entry, 24MB total, 400 entries, 10min TTL, key = exact image URL; upstream failures negative-cached briefly (default 45s; 429 honors retry-after capped at 120s) so a hurting host is never re-hammered — the SW rescue path still serves those live through the bare relay. UpstreamResult now carries retryAfter from both the H2 and h1.1 paths. RAM only, public unauthenticated image assets, nothing personalized.
+- VERIFIED LIVE: second identical /api/img request returns X-Specter-Img-Cache: hit instantly; rate-limited asset 1st 502 in 146ms → 2nd 502 in 13ms (zero upstream contact); full Data-Saver-ON Wikipedia reload + scroll: 0 broken images, thumbnails 200 at ~175–220ms; saver restored OFF (default). lint + tsc clean.
