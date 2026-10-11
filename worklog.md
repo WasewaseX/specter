@@ -300,3 +300,27 @@ Task 15 addendum — img output cache (rate-limit spiral fix):
 - E2E extension pass exposed a REAL Data-Saver defect: with saver ON, every /api/img request re-fetched upstream — on image-heavy sites this spirals into upstream rate limits (observed LIVE: Wikimedia Varnish 429 retry-after=600 on upload.wikimedia.org after repeated article loads; curl + node H2 probe both 429). Each SW reroute that 502'd also paid a wasted bare-relay rescue fetch, hammering the host twice per image per reload.
 - FIX (src/app/api/img/route.ts): bounded RAM LRU output cache — successful outputs (recompressed WebP or passthrough bytes) up to 3MB/entry, 24MB total, 400 entries, 10min TTL, key = exact image URL; upstream failures negative-cached briefly (default 45s; 429 honors retry-after capped at 120s) so a hurting host is never re-hammered — the SW rescue path still serves those live through the bare relay. UpstreamResult now carries retryAfter from both the H2 and h1.1 paths. RAM only, public unauthenticated image assets, nothing personalized.
 - VERIFIED LIVE: second identical /api/img request returns X-Specter-Img-Cache: hit instantly; rate-limited asset 1st 502 in 146ms → 2nd 502 in 13ms (zero upstream contact); full Data-Saver-ON Wikipedia reload + scroll: 0 broken images, thumbnails 200 at ~175–220ms; saver restored OFF (default). lint + tsc clean.
+
+---
+Task ID: 16
+Agent: Z.ai Code (main)
+Task: Continue never-stop — full live re-verification pass on rev-17l-asset-guard (suite, diagnostics, speed, BBC, YouTube search/watch, plain video, HN, mobile, dev.log audit); no code churn (zero defects found); push
+
+Work Log:
+- USER DIRECTIVE: "CONTINUE NEVER STOP" — continue the reliability loop from baseline af0b8e1 (rev-17l-img-cache, already on origin).
+- FRESH SESSION E2E (agent-browser, screenshots in e2e-shots/rev17m*):
+  * Compatibility suite (drawer, rev-17l-asset-guard): 10 passed · 3 site walls · 0 code/network failures. Walls unchanged and honestly classified: YouTube playback LOGIN_REQUIRED, YouTube sign-in completion-refused, Iwara Cloudflare checkpoint — each with pipeline-contrast proof. Recoveries re-proven: relay restart (node pid 1659) auto-healed in 983ms; download cancel/resume byte-exact; 6MB background download did not starve 3 navigations (median 979ms).
+  * Engine diagnostics: 11/11 (relay_heartbeat 11ms, post_roundtrip 72ms, cookie_jar 380ms, range_streaming 15ms, document_rewrite 43ms, blocker_precision 0ms, ...).
+  * Network Speed (medians, n=6): Leg A 37ms (9–57), Leg B 939ms (929–967), TTFB 938ms, 100KB 1.28 MB/s vs 1MB 8.13 MB/s + the honest "Leg B is the bottleneck — relay host route; engine tuning cannot change this" verdict. Consistent with every prior run (907/933/951/972/939ms) — the evidence base for "next speed improvement = relay network location, not code".
+  * BBC: tab loads, 21/21 images loaded after scroll, 0 broken (total re-census after BBC's own feed re-hydration).
+  * YouTube: home booted fully (162KB content, yt-searchbox); in-frame search "big buck bunny" → results page title + 20 video renderers + 51 imgs streaming via relay with 0 genuinely broken images (2 are YouTube's own yoodle quirk — img src = the page URL itself, broken on YouTube too; the rest are empty-src lazy placeholders that fill on scroll — a false-positive census lesson recorded here: complete+naturalWidth0+emptySrc ≠ broken). Watch page reached via in-frame anchor click ("Big Buck Bunny 60fps 4K — Official Blender Foundation Short Film"); video readyState 0 with SPECTER's honest banner "Playback blocked by YouTube — anti-bot wall" — matches the suite classification exactly (rendering ≠ playing, upstream policy).
+  * Plain video (MDN flower.mp4 via omnibox): readyState 4, 960x540, PLAYED TO END (5.05/5.06s), seek back to 1.0s resumed from buffered cache (t→3.95s, no refetch).
+  * Hacker News: 30 rows.
+  * Mobile 390px: zero horizontal overflow, tab strip renders 3 tabs.
+  * dev.log audit (fresh server): ZERO unexplained errors — the only notable line was the engine-asset guard 307'ing one site-absolute github.com/uv/specter-client.js request (958ms = first-hit dev compile; designed behaviour, not a defect), plus deliberate relay restart + net-test suite + 206 Range streams (YouTube UI sounds, flower.mp4). No 404/429/502 anywhere.
+- CENSUS METHODOLOGY LESSON (recorded for future loop runs): counting img.complete && naturalWidth===0 as "broken" over-reports on lazy sites; the correct census excludes empty-src placeholders and self-referencing srcs. The suite's own extractors already load by explicit URL and are immune.
+- DECISION (advisory-compliant): zero defects found this pass → NO code churn, NO scheduler/cache changes (the advisory forbids rewriting without evidence; all evidence says code is healthy, Leg B network location is the bottleneck). The run's value: regression proof + one methodology lesson + push of the pending local commit.
+
+Stage Summary:
+- rev-17l-asset-guard re-proven end-to-end on a fresh session: suite 10/0-failures, diagnostics 11/11, honest speed verdict, BBC/YouTube/HN/video/mobile baselines all green, dev.log clean. The gateway is stable; remaining walls are upstream policies (YouTube playback/sign-in, Cloudflare) — test-proven, not assumed.
+- No code changes made this pass (evidence-based restraint per the advisory). Pushed pending commits to github.com/WasewaseX/specter (token kept in the git remote, never committed).
