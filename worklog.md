@@ -324,3 +324,8 @@ Work Log:
 Stage Summary:
 - rev-17l-asset-guard re-proven end-to-end on a fresh session: suite 10/0-failures, diagnostics 11/11, honest speed verdict, BBC/YouTube/HN/video/mobile baselines all green, dev.log clean. The gateway is stable; remaining walls are upstream policies (YouTube playback/sign-in, Cloudflare) — test-proven, not assumed.
 - No code changes made this pass (evidence-based restraint per the advisory). Pushed pending commits to github.com/WasewaseX/specter (token kept in the git remote, never committed).
+
+Task 16 addendum — final two baselines (completing the matrix):
+- Session restore across reload: all 3 tabs (BBC / MDN flower.mp4 / HN) re-opened with the active HN tab re-mounting its frame at the exact URL — P5 recovery verified again on this pass.
+- Safe static cache (P5): hit counter = 5 after restore — restored tabs' statics served from cache ("repeat visits — zero re-download"), zero upstream re-fetch.
+- COMPLETE TASK-16 MATRIX: suite 10 passed / 3 upstream walls / 0 code-network failures · diagnostics 11/11 · Leg A 37ms / Leg B 939ms (tight 929–967 spread = pure network RTT, NO scheduler-induced queueing — code-side lane starvation would show multi-second outliers; this is the direct evidence that the next speed improvement must come from the relay's network location, not code) · BBC 21/21 images · YouTube search 20 results with 0 real broken thumbs · watch page rendered with honest playback wall · flower.mp4 played to end + seek-back from cache · HN 30 rows · mobile 390px clean · session restore 3/3 · cache hits live · dev.log zero unexplained errors.
